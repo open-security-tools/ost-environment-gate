@@ -1,0 +1,5 @@
+target/
+.aws-sam/
+.env
+.env.local
+.secrets/
