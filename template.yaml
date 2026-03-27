@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ost-environment-gate - GitHub deployment protection rule webhook handler.
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - arm64
+    # This exceeds GitHub's 10s webhook response expectation, but the critical
+    # deployment approval/rejection is written back via the deployments API and
+    # can still complete even if GitHub marks the webhook delivery as failed.
+    Timeout: 60
+    MemorySize: 256
+
+Parameters:
+  PolicyJson:
+    Type: String
+    Description: JSON policy document for deployment protection evaluation
+  AppIdParameterName:
+    Type: String
+    Default: /ost/app-id
+  AppPrivateKeySecretName:
+    Type: String
+    Description: Secrets Manager secret name containing the GitHub App PEM private key
+  WebhookSecretParameterName:
+    Type: String
+    Default: /ost/webhook-secret
+
+Resources:
+  Api:
+    Type: AWS::Serverless::HttpApi
+
+  EnvironmentGateFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+    Properties:
+      CodeUri: .
+      Handler: bootstrap
+      Environment:
+        Variables:
+          POLICY_JSON: !Ref PolicyJson
+          APP_ID_PARAMETER: !Ref AppIdParameterName
+          APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
+          WEBHOOK_SECRET_PARAMETER: !Ref WebhookSecretParameterName
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /health
+            Method: GET
+        GitHubWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /github/webhook
+            Method: POST
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AppIdParameterName}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WebhookSecretParameterName}
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}*
+
+Outputs:
+  ApiUrl:
+    Description: Base API URL
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  WebhookUrl:
+    Description: Full GitHub webhook URL
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/github/webhook

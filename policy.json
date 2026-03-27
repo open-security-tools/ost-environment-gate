@@ -1,0 +1,6 @@
+{
+  "allowed_ref": "refs/heads/main",
+  "release_environment_name": "release",
+  "release_gate_job_name": "release-gate",
+  "release_workflow_path": ".github/workflows/release.yml"
+}

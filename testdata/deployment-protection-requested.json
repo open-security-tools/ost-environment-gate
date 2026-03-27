@@ -1,0 +1,28 @@
+{
+  "action": "requested",
+  "environment": "release",
+  "event": "workflow_dispatch",
+  "deployment_callback_url": "https://api.github.com/repos/zaniebot/release-authenticator-example/actions/runs/23625057533/deployment_protection_rule",
+  "deployment": {
+    "id": 4189575565,
+    "environment": "release"
+  },
+  "pull_requests": [],
+  "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
+  "ref": "main",
+  "repository": {
+    "id": 1192056896,
+    "name": "release-authenticator-example",
+    "full_name": "zaniebot/release-authenticator-example",
+    "owner": {
+      "login": "zaniebot"
+    }
+  },
+  "sender": {
+    "login": "zaniebot",
+    "id": 242828183
+  },
+  "installation": {
+    "id": 119022551
+  }
+}

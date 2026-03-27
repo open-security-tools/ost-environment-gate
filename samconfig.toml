@@ -1,0 +1,7 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "ost-environment-gate"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
