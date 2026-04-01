@@ -91,4 +91,4 @@ upsert_ssm_parameter "$APP_ID_PARAMETER" "$APP_ID"
 upsert_ssm_parameter "$WEBHOOK_SECRET_PARAMETER" "$GITHUB_WEBHOOK_SECRET"
 upsert_secret_from_file "$APP_PRIVATE_KEY_SECRET_NAME" "$APP_PRIVATE_KEY_FILE"
 
-echo "synced APP_ID parameter, webhook secret parameter, and private key secret"
+echo "Deployed application id, webhook secret, and private key to AWS SSM"
