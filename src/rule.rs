@@ -140,11 +140,8 @@ pub async fn handle_deployment_protection_rule_webhook(
 
     github::review_deployment_protection_rule(
         &config.http_client,
-        &config.github_api_base,
         installation_token.token.as_str(),
-        requested.repository.owner().as_str(),
-        requested.repository.name().as_str(),
-        *requested.run_id,
+        &requested.deployment_callback_url,
         &DeploymentProtectionRuleReviewPayload {
             environment_name: requested.environment.as_str(),
             state: match decision.state {
@@ -256,6 +253,7 @@ mod tests {
                 "name": "release-authenticator-example",
                 "owner": { "login": "zaniebot" }
             },
+            "deployment_callback_url": "https://api.github.com/repos/zaniebot/release-authenticator-example/actions/runs/23625057533/deployment_protection_rule",
             "workflow_run": { "id": 23625057533_u64 }
         });
         if let Some(r) = git_ref {

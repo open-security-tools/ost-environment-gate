@@ -214,10 +214,15 @@ mod integration_tests {
         }
 
         fn requested_payload(&self) -> Value {
-            serde_json::from_str(include_str!(
+            let mut payload: Value = serde_json::from_str(include_str!(
                 "../testdata/deployment-protection-requested.json"
             ))
-            .unwrap()
+            .unwrap();
+            payload["deployment_callback_url"] = json!(format!(
+                "{}/repos/{OWNER}/{REPO}/actions/runs/{RUN_ID}/deployment_protection_rule",
+                self.server.uri()
+            ));
+            payload
         }
 
         fn webhook_request(&self, event: &str, payload: &Value) -> Request {
@@ -596,6 +601,40 @@ mod integration_tests {
             json!({
                 "code": "deployment_protection_payload_invalid",
                 "error": "deployment protection payload is invalid"
+            })
+        );
+        assert!(harness.received_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_returns_unprocessable_entity_for_missing_workflow_run_id() {
+        let harness = Harness::new().await;
+        let payload = json!({
+            "action": "requested",
+            "environment": "release",
+            "ref": "main",
+            "installation": { "id": 1 },
+            "repository": {
+                "id": 1,
+                "full_name": "zaniebot/release-authenticator-example"
+            },
+            "deployment_callback_url": format!(
+                "{}/repos/zaniebot/release-authenticator-example/actions/runs/1/deployment_protection_rule",
+                harness.server.uri()
+            ),
+            "workflow_run": { "id": 0 }
+        });
+
+        let response = harness
+            .dispatch(harness.webhook_request("deployment_protection_rule", &payload))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(&response),
+            json!({
+                "code": "deployment_protection_run_id_invalid",
+                "error": "deployment protection payload is missing a valid workflow run id"
             })
         );
         assert!(harness.received_paths().await.is_empty());

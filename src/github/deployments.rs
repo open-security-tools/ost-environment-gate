@@ -4,8 +4,8 @@ use crate::{
     config::{EnvironmentName, GitRef},
     error::AppError,
     github::{
-        github_api_url, github_request, send_github_request, GithubApiBase, InstallationId,
-        Repository, RepositoryId, RunId,
+        github_request, send_github_request, GithubApiBase, InstallationId, Repository,
+        RepositoryId, RunId,
     },
 };
 
@@ -73,6 +73,7 @@ pub struct RequestedDeploymentProtection {
     pub repository: Repository,
     pub repository_id: RepositoryId,
     pub run_id: RunId,
+    pub deployment_callback_url: DeploymentCallbackUrl,
     /// Prevents direct struct-literal construction outside this module.
     _private: (),
 }
@@ -125,11 +126,6 @@ impl RefName {
 
 impl RequestedDeploymentProtection {
     /// Validates a raw GitHub deployment protection payload into a rule request.
-    ///
-    /// When the `workflow_run.id` field is missing and the run ID must be
-    /// extracted from the `deployment_callback_url`, the callback URL's origin
-    /// is verified against `github_api_base` to prevent accepting IDs from
-    /// URLs pointing to unexpected hosts.
     pub fn parse(
         payload: DeploymentProtectionRulePayload,
         github_api_base: &GithubApiBase,
@@ -137,6 +133,12 @@ impl RequestedDeploymentProtection {
         if payload.action.as_deref() != Some(REQUESTED_ACTION) {
             return Err(AppError::DeploymentProtectionPayloadInvalid);
         }
+
+        let deployment_callback_url = payload
+            .deployment_callback_url
+            .clone()
+            .ok_or(AppError::DeploymentProtectionPayloadInvalid)
+            .and_then(|url| DeploymentCallbackUrl::parse(url, github_api_base))?;
 
         let environment = payload
             .environment
@@ -165,20 +167,11 @@ impl RequestedDeploymentProtection {
             _ => return Err(AppError::DeploymentProtectionPayloadInvalid),
         };
 
-        let run_id = match payload
+        let run_id = payload
             .workflow_run
             .and_then(|workflow_run| workflow_run.id)
             .and_then(RunId::new)
-        {
-            Some(run_id) => run_id,
-            None => {
-                let deployment_callback_url = payload
-                    .deployment_callback_url
-                    .ok_or(AppError::DeploymentProtectionPayloadInvalid)
-                    .and_then(|url| DeploymentCallbackUrl::parse(url, github_api_base))?;
-                RunId::try_from(&deployment_callback_url)?
-            }
-        };
+            .ok_or(AppError::DeploymentProtectionRunIdInvalid)?;
 
         Ok(Self {
             environment,
@@ -187,32 +180,9 @@ impl RequestedDeploymentProtection {
             repository,
             repository_id,
             run_id,
+            deployment_callback_url,
             _private: (),
         })
-    }
-}
-
-impl TryFrom<&DeploymentCallbackUrl> for RunId {
-    type Error = AppError;
-
-    fn try_from(value: &DeploymentCallbackUrl) -> Result<Self, Self::Error> {
-        let parts = value
-            .as_url()
-            .path_segments()
-            .ok_or(AppError::DeploymentProtectionPayloadInvalid)?
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-
-        parts
-            .windows(3)
-            .find_map(|window| {
-                if window[0] == "runs" && window[2] == "deployment_protection_rule" {
-                    window[1].parse::<u64>().ok().and_then(RunId::new)
-                } else {
-                    None
-                }
-            })
-            .ok_or(AppError::DeploymentProtectionPayloadInvalid)
     }
 }
 
@@ -236,17 +206,11 @@ pub struct DeploymentProtectionRuleReviewPayload<'a> {
 /// Submits a deployment protection rule review decision back to GitHub.
 pub async fn review_deployment_protection_rule(
     http_client: &reqwest::Client,
-    github_api_base: &GithubApiBase,
     installation_token: &str,
-    owner: &str,
-    repo: &str,
-    run_id: u64,
+    deployment_callback_url: &DeploymentCallbackUrl,
     payload: &DeploymentProtectionRuleReviewPayload<'_>,
 ) -> Result<(), AppError> {
-    let url = github_api_url(
-        github_api_base,
-        &format!("repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule"),
-    )?;
+    let url = deployment_callback_url.as_url().clone();
 
     // TODO: Revisit retries here. This endpoint is also non-idempotent, so retrying
     // after an ambiguous transport failure can duplicate review side effects.
@@ -275,7 +239,8 @@ mod tests {
         RequestedDeploymentProtection,
     };
     use crate::config::{GitRef, Policy};
-    use crate::github::{GithubApiBase, RunId};
+    use crate::error::AppError;
+    use crate::github::GithubApiBase;
     use serde_json::json;
 
     fn test_github_api_base() -> GithubApiBase {
@@ -334,27 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn run_id_rejects_callback_url_without_run_id() {
-        let url = DeploymentCallbackUrl::parse(
-            "https://api.github.com/repos/octo/tools".to_string(),
-            &test_github_api_base(),
-        )
-        .unwrap();
-        assert!(RunId::try_from(&url).is_err());
-    }
-
-    #[test]
-    fn run_id_try_from_deployment_callback_url_extracts_run_id() {
-        let callback_url = DeploymentCallbackUrl::parse(
-            "https://api.github.com/repos/zaniebot/release-authenticator-example/actions/runs/23624826112/deployment_protection_rule".to_string(),
-            &test_github_api_base(),
-        )
-        .unwrap();
-
-        assert_eq!(*RunId::try_from(&callback_url).unwrap(), 23624826112);
-    }
-
-    #[test]
     fn requested_deployment_protection_rejects_wrong_action() {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "completed",
@@ -393,6 +337,22 @@ mod tests {
         .unwrap();
 
         assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
+    }
+
+    #[test]
+    fn requested_deployment_protection_rejects_missing_workflow_run_id() {
+        let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
+            "action": "requested",
+            "environment": "release",
+            "installation": { "id": 1 },
+            "repository": { "id": 1, "full_name": "octo/tools" },
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+        }))
+        .unwrap();
+
+        let error =
+            RequestedDeploymentProtection::parse(payload, &test_github_api_base()).unwrap_err();
+        assert!(matches!(error, AppError::DeploymentProtectionRunIdInvalid));
     }
 
     #[test]
