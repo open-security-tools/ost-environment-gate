@@ -256,6 +256,7 @@ mod tests {
                 "name": "release-authenticator-example",
                 "owner": { "login": "zaniebot" }
             },
+            "deployment_callback_url": "https://api.github.com/repos/zaniebot/release-authenticator-example/actions/runs/23625057533/deployment_protection_rule",
             "workflow_run": { "id": 23625057533_u64 }
         });
         if let Some(r) = git_ref {

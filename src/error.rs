@@ -23,6 +23,8 @@ pub enum AppError {
     InvalidGithubWebhookSignature,
     #[error("deployment protection payload is invalid")]
     DeploymentProtectionPayloadInvalid,
+    #[error("deployment protection payload is missing a valid workflow run id")]
+    DeploymentProtectionRunIdInvalid,
     #[error("github app authentication failed")]
     GithubAppAuthInvalid,
     #[error("github rejected access token request")]
@@ -55,6 +57,7 @@ impl AppError {
             Self::NotFound => "not_found",
             Self::InvalidGithubWebhookSignature => "invalid_github_webhook_signature",
             Self::DeploymentProtectionPayloadInvalid => "deployment_protection_payload_invalid",
+            Self::DeploymentProtectionRunIdInvalid => "deployment_protection_run_id_invalid",
             Self::GithubAppAuthInvalid => "github_app_auth_invalid",
             Self::GithubAccessTokenRequestForbidden => "github_access_token_request_forbidden",
             Self::InstallationNotFound => "installation_not_found",
@@ -79,6 +82,7 @@ impl AppError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidGithubWebhookSignature => StatusCode::UNAUTHORIZED,
             Self::DeploymentProtectionPayloadInvalid => StatusCode::BAD_REQUEST,
+            Self::DeploymentProtectionRunIdInvalid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::GithubAppAuthInvalid | Self::GithubAccessTokenRequestForbidden => {
                 StatusCode::FAILED_DEPENDENCY
             }
