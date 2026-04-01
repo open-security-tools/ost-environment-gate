@@ -18,21 +18,30 @@ pub struct Repository {
     name: RepositoryName,
 }
 
-fn is_valid_repository_part(value: &str) -> bool {
-    !value.contains('/')
+/// Returns `true` when every character in `value` is safe for use in a URL path
+/// segment. This matches the character sets GitHub allows for owner and repository
+/// names (alphanumeric, hyphen, underscore, period) and prevents URL-injection
+/// characters like `..`, `#`, `?`, `%`, or `@` from reaching `Url::join`.
+fn is_valid_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        && value != "."
+        && value != ".."
 }
 
 crate::impl_string_newtype!(
     RepositoryOwner,
     AppError,
     AppError::DeploymentProtectionPayloadInvalid,
-    validate = is_valid_repository_part
+    validate = is_valid_slug
 );
 crate::impl_string_newtype!(
     RepositoryName,
     AppError,
     AppError::DeploymentProtectionPayloadInvalid,
-    validate = is_valid_repository_part
+    validate = is_valid_slug
 );
 
 impl Repository {
@@ -85,5 +94,54 @@ impl TryFrom<String> for Repository {
         }
 
         Self::try_from((owner.to_owned(), name.to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_slug, Repository, RepositoryName, RepositoryOwner};
+
+    #[test]
+    fn is_valid_slug_accepts_typical_github_names() {
+        assert!(is_valid_slug("octocat"));
+        assert!(is_valid_slug("my-org"));
+        assert!(is_valid_slug("repo_name"));
+        assert!(is_valid_slug("my.repo"));
+        assert!(is_valid_slug("A-Z_0.9"));
+    }
+
+    #[test]
+    fn is_valid_slug_rejects_path_traversal_and_url_injection() {
+        assert!(!is_valid_slug(".."));
+        assert!(!is_valid_slug("."));
+        assert!(!is_valid_slug(""));
+        assert!(!is_valid_slug("foo/bar"));
+        assert!(!is_valid_slug("foo#bar"));
+        assert!(!is_valid_slug("foo?bar"));
+        assert!(!is_valid_slug("foo%20bar"));
+        assert!(!is_valid_slug("foo@bar"));
+        assert!(!is_valid_slug("foo bar"));
+    }
+
+    #[test]
+    fn repository_owner_rejects_unsafe_characters() {
+        assert!(RepositoryOwner::try_from(String::from("..")).is_err());
+        assert!(RepositoryOwner::try_from(String::from("foo#bar")).is_err());
+        assert!(RepositoryOwner::try_from(String::from("foo?x=1")).is_err());
+        assert!(RepositoryOwner::try_from(String::from("valid-owner")).is_ok());
+    }
+
+    #[test]
+    fn repository_name_rejects_unsafe_characters() {
+        assert!(RepositoryName::try_from(String::from("..")).is_err());
+        assert!(RepositoryName::try_from(String::from("repo#frag")).is_err());
+        assert!(RepositoryName::try_from(String::from("valid.repo-name_1")).is_ok());
+    }
+
+    #[test]
+    fn repository_from_full_name_rejects_unsafe_components() {
+        assert!(Repository::try_from(String::from("../evil")).is_err());
+        assert!(Repository::try_from(String::from("owner/..")).is_err());
+        assert!(Repository::try_from(String::from("ok-owner/ok-repo")).is_ok());
     }
 }
