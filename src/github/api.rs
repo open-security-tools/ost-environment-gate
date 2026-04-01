@@ -87,7 +87,7 @@ pub async fn send_github_request(
             .flatten();
 
         match builder.send().await {
-            Ok(response) if is_retryable_status(response.status()) => {
+            Ok(response) if is_retryable_response(response.status(), response.headers()) => {
                 if let Some(next_builder) = next_builder {
                     let retry_delay = retry_delay(response.status(), response.headers(), backoff);
                     tracing::warn!(
@@ -165,7 +165,7 @@ fn normalize_github_api_base(mut url: reqwest::Url) -> reqwest::Url {
 }
 
 fn retry_delay(status: StatusCode, headers: &HeaderMap, fallback: Duration) -> Duration {
-    if is_retryable_status(status) {
+    if is_retryable_response(status, headers) {
         retry_after_delay(headers).unwrap_or(fallback)
     } else {
         fallback
@@ -192,6 +192,11 @@ fn is_retryable_status(status: StatusCode) -> bool {
             | StatusCode::SERVICE_UNAVAILABLE
             | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+fn is_retryable_response(status: StatusCode, headers: &HeaderMap) -> bool {
+    is_retryable_status(status)
+        || (status == StatusCode::FORBIDDEN && headers.contains_key(RETRY_AFTER))
 }
 
 fn is_retryable_error(error: &reqwest::Error) -> bool {
@@ -330,6 +335,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_github_request_retries_forbidden_with_retry_after_before_success() {
+        let server = MockServer::start().await;
+        let client = test_http_client();
+
+        Mock::given(method("GET"))
+            .and(path("/secondary-rate-limit"))
+            .respond_with(ResponseTemplate::new(403).insert_header("retry-after", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/secondary-rate-limit"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = send_github_request(
+            client.get(format!("{}/secondary-rate-limit", server.uri())),
+            "secondary rate limit test",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn send_github_request_does_not_retry_non_retryable_status() {
         let server = MockServer::start().await;
         let client = test_http_client();
@@ -349,6 +385,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_github_request_does_not_retry_forbidden_without_retry_after() {
+        let server = MockServer::start().await;
+        let client = test_http_client();
+
+        Mock::given(method("GET"))
+            .and(path("/forbidden"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = send_github_request(
+            client.get(format!("{}/forbidden", server.uri())),
+            "forbidden test",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
