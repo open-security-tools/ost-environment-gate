@@ -315,7 +315,10 @@ mod tests {
         // Page beyond the limit should never be requested.
         Mock::given(method("GET"))
             .and(path("/repos/octo/tools/actions/runs/999/jobs"))
-            .and(query_param("page", (super::MAX_WORKFLOW_JOBS_PAGES + 1).to_string()))
+            .and(query_param(
+                "page",
+                (super::MAX_WORKFLOW_JOBS_PAGES + 1).to_string(),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jobs": workflow_jobs(1, 9999)
             })))

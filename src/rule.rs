@@ -227,10 +227,10 @@ pub fn evaluate_release_protection(
 mod tests {
     use super::{evaluate_release_protection, ReleaseProtectionState};
     use crate::{
-        config::{EnvironmentName, GitRef, Policy},
+        config::{GitRef, Policy},
         github::{
-            Conclusion, InstallationId, RefName, Repository, RepositoryId,
-            RequestedDeploymentProtection, RunId, WorkflowJobSummary, WorkflowRunSummary,
+            Conclusion, DeploymentProtectionRulePayload, GithubApiBase,
+            RequestedDeploymentProtection, WorkflowJobSummary, WorkflowRunSummary,
         },
     };
     use serde_json::json;
@@ -246,17 +246,24 @@ mod tests {
     }
 
     fn test_requested(environment: &str, git_ref: Option<&str>) -> RequestedDeploymentProtection {
-        let repository =
-            Repository::try_from(String::from("zaniebot/release-authenticator-example")).unwrap();
-
-        RequestedDeploymentProtection {
-            environment: EnvironmentName::try_from(environment.to_string()).unwrap(),
-            git_ref: git_ref.map(|value| RefName::try_from(value).unwrap()),
-            installation_id: InstallationId::new(1).unwrap(),
-            repository,
-            repository_id: RepositoryId::new(1192056896).unwrap(),
-            run_id: RunId::new(23625057533).unwrap(),
+        let mut payload = json!({
+            "action": "requested",
+            "environment": environment,
+            "installation": { "id": 1 },
+            "repository": {
+                "id": 1192056896,
+                "full_name": "zaniebot/release-authenticator-example",
+                "name": "release-authenticator-example",
+                "owner": { "login": "zaniebot" }
+            },
+            "workflow_run": { "id": 23625057533_u64 }
+        });
+        if let Some(r) = git_ref {
+            payload["ref"] = json!(r);
         }
+        let payload: DeploymentProtectionRulePayload = serde_json::from_value(payload).unwrap();
+        let base = GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
+        RequestedDeploymentProtection::parse(payload, &base).unwrap()
     }
 
     #[test]
