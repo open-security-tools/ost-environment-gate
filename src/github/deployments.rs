@@ -4,8 +4,8 @@ use crate::{
     config::{EnvironmentName, GitRef},
     error::AppError,
     github::{
-        github_api_url, github_request, send_github_request, GithubApiBase, InstallationId,
-        Repository, RepositoryId, RunId,
+        github_request, send_github_request, GithubApiBase, InstallationId, Repository,
+        RepositoryId, RunId,
     },
 };
 
@@ -73,6 +73,7 @@ pub struct RequestedDeploymentProtection {
     pub repository: Repository,
     pub repository_id: RepositoryId,
     pub run_id: RunId,
+    pub deployment_callback_url: DeploymentCallbackUrl,
     /// Prevents direct struct-literal construction outside this module.
     _private: (),
 }
@@ -133,11 +134,11 @@ impl RequestedDeploymentProtection {
             return Err(AppError::DeploymentProtectionPayloadInvalid);
         }
 
-        let callback_url = payload
+        let deployment_callback_url = payload
             .deployment_callback_url
             .clone()
-            .ok_or(AppError::DeploymentProtectionPayloadInvalid)?;
-        DeploymentCallbackUrl::parse(callback_url, github_api_base)?;
+            .ok_or(AppError::DeploymentProtectionPayloadInvalid)
+            .and_then(|url| DeploymentCallbackUrl::parse(url, github_api_base))?;
 
         let environment = payload
             .environment
@@ -179,32 +180,9 @@ impl RequestedDeploymentProtection {
             repository,
             repository_id,
             run_id,
+            deployment_callback_url,
             _private: (),
         })
-    }
-}
-
-impl TryFrom<&DeploymentCallbackUrl> for RunId {
-    type Error = AppError;
-
-    fn try_from(value: &DeploymentCallbackUrl) -> Result<Self, Self::Error> {
-        let parts = value
-            .as_url()
-            .path_segments()
-            .ok_or(AppError::DeploymentProtectionPayloadInvalid)?
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-
-        parts
-            .windows(3)
-            .find_map(|window| {
-                if window[0] == "runs" && window[2] == "deployment_protection_rule" {
-                    window[1].parse::<u64>().ok().and_then(RunId::new)
-                } else {
-                    None
-                }
-            })
-            .ok_or(AppError::DeploymentProtectionPayloadInvalid)
     }
 }
 
@@ -228,17 +206,11 @@ pub struct DeploymentProtectionRuleReviewPayload<'a> {
 /// Submits a deployment protection rule review decision back to GitHub.
 pub async fn review_deployment_protection_rule(
     http_client: &reqwest::Client,
-    github_api_base: &GithubApiBase,
     installation_token: &str,
-    owner: &str,
-    repo: &str,
-    run_id: u64,
+    deployment_callback_url: &DeploymentCallbackUrl,
     payload: &DeploymentProtectionRuleReviewPayload<'_>,
 ) -> Result<(), AppError> {
-    let url = github_api_url(
-        github_api_base,
-        &format!("repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule"),
-    )?;
+    let url = deployment_callback_url.as_url().clone();
 
     // TODO: Revisit retries here. This endpoint is also non-idempotent, so retrying
     // after an ambiguous transport failure can duplicate review side effects.

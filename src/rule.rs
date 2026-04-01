@@ -140,11 +140,8 @@ pub async fn handle_deployment_protection_rule_webhook(
 
     github::review_deployment_protection_rule(
         &config.http_client,
-        &config.github_api_base,
         installation_token.token.as_str(),
-        requested.repository.owner().as_str(),
-        requested.repository.name().as_str(),
-        *requested.run_id,
+        &requested.deployment_callback_url,
         &DeploymentProtectionRuleReviewPayload {
             environment_name: requested.environment.as_str(),
             state: match decision.state {
