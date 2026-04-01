@@ -104,6 +104,13 @@ pub async fn fetch_workflow_run(
         })
 }
 
+/// Maximum number of pages to fetch when listing workflow jobs.
+///
+/// Each page contains up to 100 jobs, so this caps the total at 1 000 jobs per
+/// run — well above any legitimate workflow while preventing unbounded pagination
+/// from consuming Lambda memory and execution time.
+const MAX_WORKFLOW_JOBS_PAGES: u32 = 10;
+
 /// Fetches all workflow jobs for a run by following GitHub pagination.
 pub async fn fetch_workflow_jobs(
     http_client: &reqwest::Client,
@@ -117,6 +124,14 @@ pub async fn fetch_workflow_jobs(
     let mut jobs = Vec::new();
 
     loop {
+        if page > MAX_WORKFLOW_JOBS_PAGES {
+            tracing::warn!(
+                max_pages = MAX_WORKFLOW_JOBS_PAGES,
+                total_jobs = jobs.len(),
+                "workflow jobs pagination limit reached"
+            );
+            break;
+        }
         let url = github_api_url(
             github_api_base,
             &format!("repos/{owner}/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}"),
@@ -277,5 +292,55 @@ mod tests {
             error,
             crate::error::AppError::WorkflowRunLookupFailed
         ));
+    }
+
+    #[tokio::test]
+    async fn fetch_workflow_jobs_stops_at_page_limit() {
+        let server = MockServer::start().await;
+
+        for page in 1..=super::MAX_WORKFLOW_JOBS_PAGES {
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/tools/actions/runs/999/jobs"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", page.to_string()))
+                .and(header("authorization", "Bearer installation-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "jobs": workflow_jobs(100, ((page - 1) * 100) as usize)
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        // Page beyond the limit should never be requested.
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/actions/runs/999/jobs"))
+            .and(query_param(
+                "page",
+                (super::MAX_WORKFLOW_JOBS_PAGES + 1).to_string(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jobs": workflow_jobs(1, 9999)
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let jobs = fetch_workflow_jobs(
+            &test_http_client(),
+            &test_base_url(&server),
+            "installation-token",
+            "octo",
+            "tools",
+            999,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            jobs.len(),
+            (super::MAX_WORKFLOW_JOBS_PAGES * 100) as usize,
+            "should return exactly MAX_WORKFLOW_JOBS_PAGES * 100 jobs"
+        );
     }
 }
