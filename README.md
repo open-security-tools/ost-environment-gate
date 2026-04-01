@@ -1,158 +1,26 @@
 # ost-environment-gate
 
-Rust AWS Lambda that handles GitHub App `deployment_protection_rule` webhooks
-and approves or rejects the protected release environment based on a
-configurable policy.
+GitHub's environments allow adding required reviewers as a deployment protection rule. When applied
+to a release environment, this allows for 2-factor release workflows where a second team member must
+approve the workflow before it can access the release secrets.
 
-## How it works
+Unfortunately GitHub applies the deployment protection to every job that runs in the workflow. If a
+release process has multiple steps, then each step needs to be approved as it starts.
 
-When a workflow run requests a deployment to a protected environment, GitHub
-sends a `deployment_protection_rule` webhook. This Lambda:
+To work around this issue, we make use of the `deployment_protection_rule` webhook which a GitHub
+App can subscribe to. The GitHub App can then be used to approve or deny deployments to an
+environment. The human approval in a 2-factor release workflow is retained by having two
+environments.
 
-1. Verifies the webhook signature
-2. Mints a scoped GitHub App installation token
-3. Fetches the workflow run and its jobs
-4. Evaluates the policy (ref, environment, workflow path, gate job)
-5. Posts an approval or rejection back to GitHub
+1. `release-gate`: This requires approval by a human
+2. `release`: This requires approval from the GitHub App
 
-## Endpoints
+The GitHub App has a simple purpose: approve the `release` deployment if the `release-gate`
+deployment was approved.
 
-- `GET /health` — liveness check
-- `POST /github/webhook` — GitHub App webhook receiver
+## GitHub Actions workflow
 
-## Policy
-
-The gate evaluates four conditions, all of which must pass:
-
-| Field | Description |
-|---|---|
-| `allowed_ref` | Canonical git ref (e.g. `refs/heads/main`) |
-| `release_environment_name` | GitHub environment name to protect |
-| `release_gate_job_name` | Job that must succeed before approval |
-| `release_workflow_path` | Workflow file path that must match |
-
-Example `policy.json`:
-
-```json
-{
-  "allowed_ref": "refs/heads/main",
-  "release_environment_name": "release",
-  "release_gate_job_name": "release-gate",
-  "release_workflow_path": ".github/workflows/release.yml"
-}
-```
-
-## GitHub App setup
-
-### Permissions
-
-- **Actions**: read-only
-- **Deployments**: read and write
-- **Metadata**: read-only
-
-### Webhook events
-
-- `deployment_protection_rule`
-
-### Installation
-
-Install the app on the target repository. The app must be added as a
-**custom deployment protection rule** on the environment specified in the
-policy (e.g. `release`).
-
-## Deployment
-
-### Prerequisites
-
-- [cargo-lambda](https://www.cargo-lambda.info/)
-- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- [jq](https://jqlang.github.io/jq/)
-- AWS credentials configured
-
-### First deployment
-
-```bash
-# 1. Create the env file
-cp .env.example .env
-
-# 2. Fill in .env with your values (see below)
-
-# 3. Place the GitHub App private key
-mkdir -p .secrets
-cp /path/to/your-app.private-key.pem .secrets/github-app-private-key.pem
-
-# 4. Create the policy file
-#    Edit policy.json with your repo's settings
-cp policy-example.json policy.json
-
-# 5. Sync secrets to AWS
-make deploy-secrets
-
-# 6. Deploy the stack
-make deploy
-```
-
-### .env reference
-
-```bash
-STACK_NAME=ost-environment-gate
-POLICY_FILE=policy.json
-
-# GitHub App credentials
-APP_ID=your-app-id          # numeric App ID or Client ID
-APP_ID_PARAMETER=/ost/app-id
-APP_PRIVATE_KEY_FILE=.secrets/github-app-private-key.pem
-APP_PRIVATE_KEY_SECRET_NAME=ost/app-private-key
-
-# Webhook secret (must match the secret configured in the GitHub App)
-GITHUB_WEBHOOK_SECRET=your-webhook-secret
-WEBHOOK_SECRET_PARAMETER=/ost/webhook-secret
-```
-
-> **Note**: The GitHub App Client ID (e.g. `Iv23livJGL0RUXC4JUfC`) can be
-> used in place of the numeric App ID for installation token requests.
-
-### What `make deploy-secrets` does
-
-Syncs three values from `.env` into AWS:
-
-| Source | Destination | Service |
-|---|---|---|
-| `APP_ID` | `APP_ID_PARAMETER` | SSM SecureString |
-| `GITHUB_WEBHOOK_SECRET` | `WEBHOOK_SECRET_PARAMETER` | SSM SecureString |
-| `APP_PRIVATE_KEY_FILE` | `APP_PRIVATE_KEY_SECRET_NAME` | Secrets Manager |
-
-### What `make deploy` does
-
-1. Compacts `policy.json` with `jq -c`
-2. Runs `sam build --beta-features --no-use-container`
-3. Runs `sam deploy` against `.aws-sam/build/template.yaml` with:
-   - `--resolve-s3`
-   - `--capabilities CAPABILITY_IAM`
-   - `--no-fail-on-empty-changeset`
-   - policy and parameter overrides from `.env`
-
-### IAM permissions
-
-The SAM template grants the Lambda:
-
-- `ssm:GetParameter` on the app ID and webhook secret parameters
-- `secretsmanager:GetSecretValue` on the private key secret
-
-SSM parameter names must include the leading `/` (e.g. `/ost/app-id`). The
-template constructs IAM ARNs correctly from these names.
-
-### After deployment
-
-The stack outputs:
-
-- **ApiUrl** — base URL for the API Gateway
-- **WebhookUrl** — the full URL to configure as the GitHub App webhook endpoint
-
-Configure the `WebhookUrl` as your GitHub App's webhook URL with the same
-secret you set in `GITHUB_WEBHOOK_SECRET`.
-
-## Example workflow
+A minimal workflow would look like this:
 
 ```yaml
 name: Release
@@ -170,63 +38,64 @@ jobs:
   release-gate:
     name: release-gate
     runs-on: ubuntu-latest
-    environment:
-      name: release-gate
-      deployment: false
+    environment: release-gate
     steps:
       - run: echo "Release approved"
 
   release:
-    name: Create release
+    name: Publish release
     runs-on: ubuntu-latest
     needs: [release-gate]
     environment: release
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - run: gh release create "v${{ inputs.version }}" --generate-notes
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - run: echo "Use a secret from release!"
 ```
 
-The `release-gate` environment requires manual approval. The `release`
-environment is protected by the deployment protection rule, which the gate
-Lambda evaluates automatically.
+## GitHub App
 
-## Local development
+The minimal manifest for the GitHub App is:
 
-```bash
-cargo test       # run tests
-cargo fmt        # format code
+```json
+{
+  "name": "ost-environment-gate",
+  "url": "https://github.com/open-security-tools/ost-environment-gate/",
+  "public": false,
+  "hook_attributes": {
+    "url": "https://example.execute-api.us-east-2.amazonaws.com/github/webhook",
+    "active": true
+  },
+  "default_permissions": {
+    "actions": "read",
+    "deployments": "write"
+  },
+  "default_events": [
+    "deployment_protection_rule"
+  ]
+}
 ```
 
-### Running tests
+The GitHub App requires the minimum permissions to perform this action.
 
-The test suite includes:
 
-- Policy deserialization and validation
-- Deployment protection payload parsing
-- Release protection evaluation logic
-- GitHub API client tests using wiremock
-- Webhook signature verification
+## Webhook
 
-## Configuration reference
+The webhook API is implemented in Rust and deployed as a Lambda via AWS SAM.
 
-### Runtime environment variables
+The GitHub App ID and webhook secret are stored in AWS SSM Parameter Store. The private key is
+stored in AWS Secrets Manager.
 
-| Variable | Source | Description |
-|---|---|---|
-| `POLICY_JSON` | SAM parameter | Compacted policy JSON |
-| `APP_ID_PARAMETER` | SAM parameter | SSM parameter name for the App ID |
-| `APP_PRIVATE_KEY_SECRET_NAME` | SAM parameter | Secrets Manager secret name |
-| `WEBHOOK_SECRET_PARAMETER` | SAM parameter | SSM parameter name for webhook secret |
-| `GITHUB_API_URL` | Optional | Override GitHub API base URL (default: `https://api.github.com/`) |
+The webhook lifecycle is roughly:
 
-### Direct environment variables (for local development)
-
-| Variable | Description |
-|---|---|
-| `APP_ID` | GitHub App ID or Client ID |
-| `APP_PRIVATE_KEY` | PEM private key (escaped newlines supported) |
-| `GITHUB_WEBHOOK_SECRET` | Webhook secret string |
+1. Receive an event from GitHub
+1. Validate the event is authentic using the webhook secret
+1. Discard non-`deployment_protection_rule` events
+1. Use the private key to mint a JWT
+1. Exchange the JWT for a GitHub access token (`POST /app/installations/{id}/access_tokens`)
+1. Extract the workflow run id from the event
+1. Validate that the workflow run comes from the expected workflow file (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`)
+1. Read the workflow jobs for the run (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`)
+1. Find the release gate job and check that it succeeded
+1. Approve or deny the deployment (`POST /repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule`)
+1. Return an HTTP 204
