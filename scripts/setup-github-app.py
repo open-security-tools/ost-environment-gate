@@ -34,7 +34,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 DEFAULT_ENV_FILE = ROOT_DIR / ".env"
 APP_HOMEPAGE_URL = "https://github.com/open-security-tools/ost-environment-gate/"
-APP_DESCRIPTION = "This application provides a deployment protection rule which approves deployments when a release-gate job has been previously approved."
+APP_DESCRIPTION = "This application provides a deployment protection rule which approves deployments after a successful deployment to the release-gate environment."
 
 
 class SetupError(Exception):

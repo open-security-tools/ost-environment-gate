@@ -37,8 +37,10 @@ pub enum AppError {
     GithubAccessTokenRequestFailed,
     #[error("github workflow run lookup failed")]
     WorkflowRunLookupFailed,
-    #[error("github workflow jobs lookup failed")]
-    WorkflowJobsLookupFailed,
+    #[error("github workflow job lookup failed")]
+    WorkflowJobLookupFailed,
+    #[error("github deployment lookup failed")]
+    DeploymentLookupFailed,
     #[error("github deployment protection review failed")]
     DeploymentProtectionReviewFailed,
 }
@@ -64,7 +66,8 @@ impl AppError {
             Self::InstallationTokenRequestInvalid => "installation_token_request_invalid",
             Self::GithubAccessTokenRequestFailed => "github_access_token_request_failed",
             Self::WorkflowRunLookupFailed => "workflow_run_lookup_failed",
-            Self::WorkflowJobsLookupFailed => "workflow_jobs_lookup_failed",
+            Self::WorkflowJobLookupFailed => "workflow_job_lookup_failed",
+            Self::DeploymentLookupFailed => "deployment_lookup_failed",
             Self::DeploymentProtectionReviewFailed => "deployment_protection_review_failed",
         }
     }
@@ -90,7 +93,8 @@ impl AppError {
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::GithubAccessTokenRequestFailed
             | Self::WorkflowRunLookupFailed
-            | Self::WorkflowJobsLookupFailed
+            | Self::WorkflowJobLookupFailed
+            | Self::DeploymentLookupFailed
             | Self::DeploymentProtectionReviewFailed => StatusCode::BAD_GATEWAY,
         }
     }

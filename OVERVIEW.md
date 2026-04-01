@@ -61,9 +61,10 @@
  │ allowed_ref      │   │ app_id               │                          │ shared error enum  │
  │ allowed_events   │   │ app_private_key      │                          │ + http status/code │
  │ env name         │   │ webhook_secret       │                          └────────────────────┘
- │ gate job         │   │ github_api_base      │
- │ workflow path    │   │ http_client          │
- └──────────────────┘   └──────────────────────┘
+ │ gate env         │   │ github_api_base      │
+ │ gate job         │   │ http_client          │
+ │ workflow path    │   └──────────────────────┘
+ └──────────────────┘
 
                                      GitHub API layer
                                            │
@@ -73,13 +74,18 @@
 │ github/tokens.rs     │      │ github/workflows.rs  │       │ github/repositories.rs │
 │----------------------│      │----------------------│       │------------------------│
 │ create_app_jwt       │      │ fetch_workflow_run   │       │ RepositoryOwner        │
-│ mint_installation... │      │ fetch_workflow_jobs  │       │ RepositoryName         │
-│ InstallationId       │      │ RunId                │       │ Repository             │
-│ Token                │      │ WorkflowRunSummary   │       │ RepositoryId           │
-│ InstallationToken    │      │ WorkflowJobSummary   │       └────────────────────────┘
-└───────────┬──────────┘      │ Conclusion           │
-            │                 └───────────┬──────────┘
-            └───────────────┬─────────────┘
+│ mint_installation... │      │ RunId                │       │ RepositoryName         │
+│ InstallationId       │      │ WorkflowRunSummary   │       │ Repository             │
+│ Token                │      └───────────┬──────────┘       │ RepositoryId           │
+│ InstallationToken    │                  │                  └────────────────────────┘
+└───────────┬──────────┘                  │
+            │                 ┌───────────▼──────────┐
+            │                 │ github/deployments.rs│
+            │                 │----------------------│
+            │                 │ fetch_latest_env...  │
+            │                 │ fetch_latest_deploy...│
+            │                 │ DeploymentState      │
+            └───────────────┬─┴──────────────────────┘
                             ▼
               ┌─────────────────────────────────┐
               │ ReleaseProtectionDecision       │

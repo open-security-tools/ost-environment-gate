@@ -5,11 +5,14 @@ use crate::{
     error::AppError,
     github::{
         github_api_url, github_request, send_github_request, GithubApiBase, InstallationId,
-        Repository, RepositoryId, RunId,
+        Repository, RepositoryId, RunId, Token,
     },
 };
 
 const REQUESTED_ACTION: &str = "requested";
+const DEPLOYMENTS_PER_PAGE: usize = 100;
+const DEPLOYMENTS_PER_PAGE_QUERY: &str = "100";
+const MAX_ENVIRONMENT_DEPLOYMENT_PAGES: usize = 10;
 
 /// Mirrors the inbound `deployment_protection_rule` webhook payload shape from GitHub.
 ///
@@ -20,6 +23,7 @@ pub struct DeploymentProtectionRulePayload {
     pub environment: Option<String>,
     #[serde(rename = "ref")]
     pub git_ref: Option<String>,
+    pub sha: Option<String>,
     pub deployment_callback_url: Option<String>,
     pub installation: Option<InstallationRef>,
     pub repository: Option<RepositoryPayload>,
@@ -57,18 +61,37 @@ pub struct WorkflowRunRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentCallbackUrl(reqwest::Url);
 
+id_type!(DeploymentId);
+
 /// Stores a deployment ref name in either short or fully qualified form.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RefName(String);
 
+/// Stores a commit SHA from a deployment protection request.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CommitSha(String);
+
+/// Represents the possible states GitHub can report for a deployment status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentState {
+    Error,
+    Failure,
+    Inactive,
+    InProgress,
+    Pending,
+    Queued,
+    Success,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Captures the validated deployment protection request being evaluated.
-///
-/// This type can only be constructed via [`RequestedDeploymentProtection::parse`],
-/// which validates a raw webhook payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestedDeploymentProtection {
     pub environment: EnvironmentName,
     pub git_ref: Option<RefName>,
+    pub sha: CommitSha,
     pub installation_id: InstallationId,
     pub repository: Repository,
     pub repository_id: RepositoryId,
@@ -78,8 +101,25 @@ pub struct RequestedDeploymentProtection {
     _private: (),
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct DeploymentSummary {
+    id: DeploymentId,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DeploymentStatusSummary {
+    pub state: DeploymentState,
+    pub target_url: Option<String>,
+    pub log_url: Option<String>,
+}
+
 crate::impl_string_newtype!(
     RefName,
+    AppError,
+    AppError::DeploymentProtectionPayloadInvalid
+);
+crate::impl_string_newtype!(
+    CommitSha,
     AppError,
     AppError::DeploymentProtectionPayloadInvalid
 );
@@ -149,6 +189,29 @@ impl RefName {
     }
 }
 
+impl DeploymentState {
+    /// Returns the GitHub API string value for this deployment state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Failure => "failure",
+            Self::Inactive => "inactive",
+            Self::InProgress => "in_progress",
+            Self::Pending => "pending",
+            Self::Queued => "queued",
+            Self::Success => "success",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for DeploymentState {
+    /// Formats the deployment state using its GitHub API string value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl RequestedDeploymentProtection {
     /// Validates a raw GitHub deployment protection payload into a rule request.
     pub fn parse(
@@ -161,7 +224,6 @@ impl RequestedDeploymentProtection {
 
         let deployment_callback_url = payload
             .deployment_callback_url
-            .clone()
             .ok_or(AppError::DeploymentProtectionPayloadInvalid)
             .and_then(DeploymentCallbackUrl::parse)?;
 
@@ -226,6 +288,10 @@ impl RequestedDeploymentProtection {
         Ok(Self {
             environment,
             git_ref: payload.git_ref.map(RefName::try_from).transpose()?,
+            sha: payload
+                .sha
+                .ok_or(AppError::DeploymentProtectionPayloadInvalid)
+                .and_then(CommitSha::try_from)?,
             installation_id,
             repository,
             repository_id,
@@ -233,6 +299,31 @@ impl RequestedDeploymentProtection {
             deployment_callback_url,
             _private: (),
         })
+    }
+}
+
+#[cfg(test)]
+impl TryFrom<&DeploymentCallbackUrl> for RunId {
+    type Error = AppError;
+
+    fn try_from(value: &DeploymentCallbackUrl) -> Result<Self, Self::Error> {
+        let parts = value
+            .as_url()
+            .path_segments()
+            .ok_or(AppError::DeploymentProtectionPayloadInvalid)?
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+
+        parts
+            .windows(3)
+            .find_map(|window| {
+                if window[0] == "runs" && window[2] == "deployment_protection_rule" {
+                    window[1].parse::<u64>().ok().and_then(RunId::new)
+                } else {
+                    None
+                }
+            })
+            .ok_or(AppError::DeploymentProtectionPayloadInvalid)
     }
 }
 
@@ -253,10 +344,147 @@ pub struct DeploymentProtectionRuleReviewPayload<'a> {
     pub comment: &'a str,
 }
 
+/// Fetches recent deployments for the provided environment and commit SHA.
+pub async fn fetch_environment_deployments(
+    http_client: &reqwest::Client,
+    github_api_base: &GithubApiBase,
+    installation_token: &Token,
+    repository: &Repository,
+    environment: &EnvironmentName,
+    sha: &CommitSha,
+) -> Result<Vec<DeploymentId>, AppError> {
+    let url = github_api_url(github_api_base, &format!("repos/{repository}/deployments"))?;
+    let mut page = 1;
+    let mut deployment_ids = Vec::new();
+
+    loop {
+        let page_param = page.to_string();
+
+        let response = send_github_request(
+            github_request(http_client.get(url.clone()), installation_token).query(&[
+                ("environment", environment.as_str()),
+                ("sha", sha.as_str()),
+                ("per_page", DEPLOYMENTS_PER_PAGE_QUERY),
+                ("page", page_param.as_str()),
+            ]),
+            "deployment lookup",
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                ?error,
+                %repository,
+                %environment,
+                %sha,
+                page,
+                "deployment lookup failed"
+            );
+            AppError::DeploymentLookupFailed
+        })?;
+
+        if !response.status().is_success() {
+            tracing::error!(
+                status = %response.status(),
+                %repository,
+                %environment,
+                %sha,
+                page,
+                "unexpected deployment lookup status"
+            );
+            return Err(AppError::DeploymentLookupFailed);
+        }
+
+        let deployments = response
+            .json::<Vec<DeploymentSummary>>()
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    ?error,
+                    %repository,
+                    %environment,
+                    %sha,
+                    page,
+                    "failed to decode deployment lookup response"
+                );
+                AppError::DeploymentLookupFailed
+            })?;
+
+        let page_len = deployments.len();
+        deployment_ids.extend(deployments.into_iter().map(|deployment| deployment.id));
+
+        if page_len < DEPLOYMENTS_PER_PAGE {
+            break;
+        }
+
+        page += 1;
+        if page > MAX_ENVIRONMENT_DEPLOYMENT_PAGES {
+            tracing::warn!(
+                %repository,
+                %environment,
+                %sha,
+                max_pages = MAX_ENVIRONMENT_DEPLOYMENT_PAGES,
+                total_deployments = deployment_ids.len(),
+                "deployment lookup pagination limit reached"
+            );
+            break;
+        }
+    }
+
+    Ok(deployment_ids)
+}
+
+/// Fetches the latest status for a deployment.
+pub async fn fetch_latest_deployment_status(
+    http_client: &reqwest::Client,
+    github_api_base: &GithubApiBase,
+    installation_token: &Token,
+    repository: &Repository,
+    deployment_id: DeploymentId,
+) -> Result<Option<DeploymentStatusSummary>, AppError> {
+    let url = github_api_url(
+        github_api_base,
+        &format!("repos/{repository}/deployments/{deployment_id}/statuses"),
+    )?;
+
+    let response = send_github_request(
+        github_request(http_client.get(url), installation_token).query(&[("per_page", "1")]),
+        "deployment lookup",
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(?error, %repository, %deployment_id, "deployment status lookup failed");
+        AppError::DeploymentLookupFailed
+    })?;
+
+    if !response.status().is_success() {
+        tracing::error!(
+            status = %response.status(),
+            %repository,
+            %deployment_id,
+            "unexpected deployment status lookup status"
+        );
+        return Err(AppError::DeploymentLookupFailed);
+    }
+
+    response
+        .json::<Vec<DeploymentStatusSummary>>()
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                ?error,
+                %repository,
+                %deployment_id,
+                "failed to decode deployment status response"
+            );
+            AppError::DeploymentLookupFailed
+        })
+        .map(|statuses| statuses.into_iter().next())
+}
+
 /// Submits a deployment protection rule review decision back to GitHub.
 pub async fn review_deployment_protection_rule(
     http_client: &reqwest::Client,
-    installation_token: &str,
+    installation_token: &Token,
     deployment_callback_url: &DeploymentCallbackUrl,
     payload: &DeploymentProtectionRuleReviewPayload<'_>,
 ) -> Result<(), AppError> {
@@ -381,16 +609,33 @@ fn idempotent_review_422_reason(body: &str) -> Option<IdempotentReview422Reason>
 #[cfg(test)]
 mod tests {
     use super::{
-        idempotent_review_422_reason, DeploymentCallbackUrl, DeploymentProtectionRulePayload,
-        RefName, RequestedDeploymentProtection,
+        fetch_environment_deployments, fetch_latest_deployment_status,
+        idempotent_review_422_reason, CommitSha, DeploymentCallbackUrl, DeploymentId,
+        DeploymentProtectionRulePayload, DeploymentState, RefName, RequestedDeploymentProtection,
     };
-    use crate::config::{GitRef, Policy};
+    use crate::config::{EnvironmentName, GitRef, Policy};
     use crate::error::AppError;
-    use crate::github::GithubApiBase;
+    use crate::github::{GithubApiBase, Repository, RunId, Token};
     use serde_json::json;
+    use wiremock::{
+        matchers::{header, method, path, query_param},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     fn test_github_api_base() -> GithubApiBase {
         GithubApiBase::try_from(String::from("https://api.github.com")).unwrap()
+    }
+
+    fn test_repository() -> Repository {
+        Repository::try_from(String::from("octo/tools")).unwrap()
+    }
+
+    fn test_environment() -> EnvironmentName {
+        EnvironmentName::try_from(String::from("release-gate")).unwrap()
+    }
+
+    fn test_token() -> Token {
+        serde_json::from_value(json!("installation-token")).unwrap()
     }
 
     fn test_policy() -> Policy {
@@ -398,10 +643,18 @@ mod tests {
             "allowed_ref": "refs/heads/main",
             "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
-            "release_gate_job_name": "release-gate",
+            "release_gate_environment_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
         }))
         .unwrap()
+    }
+
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder().build().unwrap()
+    }
+
+    fn test_base_url(server: &MockServer) -> GithubApiBase {
+        GithubApiBase::try_from(server.uri()).unwrap()
     }
 
     #[test]
@@ -410,6 +663,8 @@ mod tests {
             "action": "requested",
             "environment": "release",
             "ref": "main",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/3/deployment_protection_rule",
             "installation": { "id": 1 },
             "repository": {
                 "id": 2,
@@ -445,11 +700,31 @@ mod tests {
     }
 
     #[test]
+    fn run_id_rejects_callback_url_without_run_id() {
+        let url =
+            DeploymentCallbackUrl::parse("https://api.github.com/repos/octo/tools".to_string())
+                .unwrap();
+        assert!(RunId::try_from(&url).is_err());
+    }
+
+    #[test]
+    fn run_id_try_from_deployment_callback_url_extracts_run_id() {
+        let callback_url = DeploymentCallbackUrl::parse(
+            "https://api.github.com/repos/zaniebot/release-authenticator-example/actions/runs/23624826112/deployment_protection_rule".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(*RunId::try_from(&callback_url).unwrap(), 23624826112);
+    }
+
+    #[test]
     fn requested_deployment_protection_rejects_wrong_action() {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "completed",
             "environment": "release",
             "ref": "main",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule",
             "installation": { "id": 1 },
             "repository": { "id": 1, "full_name": "octo/tools" },
             "workflow_run": { "id": 1 }
@@ -463,6 +738,23 @@ mod tests {
     fn requested_deployment_protection_rejects_missing_environment() {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "requested",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule",
+            "installation": { "id": 1 },
+            "repository": { "id": 1, "full_name": "octo/tools" },
+            "workflow_run": { "id": 1 }
+        }))
+        .unwrap();
+
+        assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
+    }
+
+    #[test]
+    fn requested_deployment_protection_rejects_missing_sha() {
+        let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
+            "action": "requested",
+            "environment": "release",
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule",
             "installation": { "id": 1 },
             "repository": { "id": 1, "full_name": "octo/tools" },
             "workflow_run": { "id": 1 }
@@ -477,6 +769,8 @@ mod tests {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "requested",
             "environment": "release",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule",
             "installation": { "id": 1 },
             "workflow_run": { "id": 1 }
         }))
@@ -490,9 +784,10 @@ mod tests {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "requested",
             "environment": "release",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule",
             "installation": { "id": 1 },
-            "repository": { "id": 1, "full_name": "octo/tools" },
-            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+            "repository": { "id": 1, "full_name": "octo/tools" }
         }))
         .unwrap();
 
@@ -530,6 +825,10 @@ mod tests {
         assert_eq!(
             requested.git_ref.as_ref().map(RefName::as_str),
             Some("main")
+        );
+        assert_eq!(
+            requested.sha,
+            CommitSha::try_from("47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54").unwrap()
         );
         assert_eq!(
             requested.repository.to_string(),
@@ -586,6 +885,7 @@ mod tests {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "requested",
             "environment": "release",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
             "installation": { "id": 1 },
             "repository": { "id": 1, "full_name": "octo/tools" },
             "deployment_callback_url": "https://api.github.com/repos/evil/tools/actions/runs/1/deployment_protection_rule",
@@ -601,6 +901,7 @@ mod tests {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "requested",
             "environment": "release",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
             "installation": { "id": 1 },
             "repository": { "id": 1, "full_name": "octo/tools" },
             "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/2/deployment_protection_rule",
@@ -616,6 +917,7 @@ mod tests {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "requested",
             "environment": "release",
+            "sha": "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54",
             "installation": { "id": 1 },
             "repository": { "id": 1, "full_name": "octo/tools" },
             "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1",
@@ -699,5 +1001,175 @@ mod tests {
         .to_string();
 
         assert!(idempotent_review_422_reason(&body).is_some());
+    }
+
+    #[tokio::test]
+    async fn fetch_environment_deployments_returns_matches_in_order() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/deployments"))
+            .and(query_param("environment", "release-gate"))
+            .and(query_param("sha", "abc123"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .and(header("authorization", "Bearer installation-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "id": 42 },
+                { "id": 41 }
+            ])))
+            .mount(&server)
+            .await;
+
+        let deployment_ids = fetch_environment_deployments(
+            &test_http_client(),
+            &test_base_url(&server),
+            &test_token(),
+            &test_repository(),
+            &test_environment(),
+            &CommitSha::try_from("abc123").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            deployment_ids,
+            vec![
+                DeploymentId::new(42).unwrap(),
+                DeploymentId::new(41).unwrap()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_environment_deployments_follows_pagination() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/deployments"))
+            .and(query_param("environment", "release-gate"))
+            .and(query_param("sha", "abc123"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json((1..=100).map(|id| json!({ "id": id })).collect::<Vec<_>>()),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/deployments"))
+            .and(query_param("environment", "release-gate"))
+            .and(query_param("sha", "abc123"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{ "id": 101 }])))
+            .mount(&server)
+            .await;
+
+        let deployment_ids = fetch_environment_deployments(
+            &test_http_client(),
+            &test_base_url(&server),
+            &test_token(),
+            &test_repository(),
+            &test_environment(),
+            &CommitSha::try_from("abc123").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deployment_ids.len(), 101);
+        assert_eq!(deployment_ids.first(), Some(&DeploymentId::new(1).unwrap()));
+        assert_eq!(
+            deployment_ids.last(),
+            Some(&DeploymentId::new(101).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_environment_deployments_returns_empty_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/deployments"))
+            .and(query_param("environment", "release-gate"))
+            .and(query_param("sha", "abc123"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let deployment_ids = fetch_environment_deployments(
+            &test_http_client(),
+            &test_base_url(&server),
+            &test_token(),
+            &test_repository(),
+            &test_environment(),
+            &CommitSha::try_from("abc123").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(deployment_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_deployment_status_returns_first_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/deployments/42/statuses"))
+            .and(query_param("per_page", "1"))
+            .and(header("authorization", "Bearer installation-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "state": "success",
+                    "log_url": "https://github.com/octo/tools/actions/runs/999/job/123",
+                    "target_url": "https://github.com/octo/tools/actions/runs/999/job/123"
+                },
+                { "state": "failure" }
+            ])))
+            .mount(&server)
+            .await;
+
+        let status = fetch_latest_deployment_status(
+            &test_http_client(),
+            &test_base_url(&server),
+            &test_token(),
+            &test_repository(),
+            DeploymentId::new(42).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            status.as_ref().map(|status| status.state),
+            Some(DeploymentState::Success)
+        );
+        assert_eq!(
+            status.as_ref().and_then(|status| status.log_url.as_deref()),
+            Some("https://github.com/octo/tools/actions/runs/999/job/123")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_deployment_status_returns_none_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/deployments/42/statuses"))
+            .and(query_param("per_page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let state = fetch_latest_deployment_status(
+            &test_http_client(),
+            &test_base_url(&server),
+            &test_token(),
+            &test_repository(),
+            DeploymentId::new(42).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state, None);
     }
 }

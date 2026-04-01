@@ -183,8 +183,11 @@ mod integration_tests {
     const RUN_ID: u64 = 23625057533;
     const INSTALLATION_ID: u64 = 119022551;
     const REPOSITORY_ID: u64 = 1192056896;
+    const GATE_DEPLOYMENT_ID: u64 = 4189575564;
+    const GATE_JOB_ID: u64 = 69582278191;
     const OWNER: &str = "zaniebot";
     const REPO: &str = "release-authenticator-example";
+    const SHA: &str = "47efb7196c2a1a2fd3f52f2c59f0e2dd3d0e4d54";
 
     struct Harness {
         server: MockServer,
@@ -193,9 +196,13 @@ mod integration_tests {
 
     impl Harness {
         async fn new() -> Self {
+            Self::new_with_policy(test_policy()).await
+        }
+
+        async fn new_with_policy(policy: config::Policy) -> Self {
             let server = MockServer::start().await;
             let config = config::Config {
-                policy: test_policy(),
+                policy,
                 app_id: "123".to_string().try_into().unwrap(),
                 app_private_key: test_app_private_key().to_string().try_into().unwrap(),
                 webhook_secret: WEBHOOK_SECRET.to_string().try_into().unwrap(),
@@ -346,23 +353,151 @@ mod integration_tests {
                 .await;
         }
 
-        async fn mock_workflow_jobs_success(&self, conclusion: &str) {
+        async fn mock_gate_deployment(&self) {
+            self.mock_gate_deployments(&[GATE_DEPLOYMENT_ID]).await;
+        }
+
+        async fn mock_gate_deployments(&self, deployment_ids: &[u64]) {
             Mock::given(method("GET"))
-                .and(path(workflow_jobs_path()))
+                .and(path(deployments_path()))
+                .and(query_param("environment", "release-gate"))
+                .and(query_param("sha", SHA))
                 .and(query_param("per_page", "100"))
-                .and(query_param("page", "1"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        deployment_ids
+                            .iter()
+                            .map(|id| json!({ "id": id }))
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_missing_gate_deployment(&self) {
+            Mock::given(method("GET"))
+                .and(path(deployments_path()))
+                .and(query_param("environment", "release-gate"))
+                .and(query_param("sha", SHA))
+                .and(query_param("per_page", "100"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_deployment_lookup_status(&self, status: u16) {
+            Mock::given(method("GET"))
+                .and(path(deployments_path()))
+                .and(query_param("environment", "release-gate"))
+                .and(query_param("sha", SHA))
+                .and(query_param("per_page", "100"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_gate_deployment_status(&self, state: &str) {
+            Mock::given(method("GET"))
+                .and(path(deployment_statuses_path()))
+                .and(query_param("per_page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    {
+                        "state": state,
+                        "log_url": format!(
+                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                        ),
+                        "target_url": format!(
+                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                        )
+                    }
+                ])))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_gate_deployment_status_without_job_url(&self, state: &str) {
+            Mock::given(method("GET"))
+                .and(path(deployment_statuses_path()))
+                .and(query_param("per_page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    { "state": state }
+                ])))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_gate_deployment_status_with_mismatched_job_urls(&self, state: &str) {
+            Mock::given(method("GET"))
+                .and(path(deployment_statuses_path()))
+                .and(query_param("per_page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    {
+                        "state": state,
+                        "log_url": format!(
+                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                        ),
+                        "target_url": format!(
+                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{}",
+                            GATE_JOB_ID + 1
+                        )
+                    }
+                ])))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_gate_deployment_status_with_custom_urls(
+            &self,
+            state: &str,
+            log_url: Option<String>,
+            target_url: Option<String>,
+        ) {
+            Mock::given(method("GET"))
+                .and(path(deployment_statuses_path()))
+                .and(query_param("per_page", "1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                    {
+                        "state": state,
+                        "log_url": log_url,
+                        "target_url": target_url
+                    }
+                ])))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_gate_deployment_status_lookup(&self, status: u16) {
+            Mock::given(method("GET"))
+                .and(path(deployment_statuses_path()))
+                .and(query_param("per_page", "1"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_gate_workflow_job(
+            &self,
+            name: &str,
+            conclusion: &str,
+            run_id: u64,
+            sha: &str,
+        ) {
+            Mock::given(method("GET"))
+                .and(path(workflow_job_path()))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "jobs": [{ "name": "release-gate", "conclusion": conclusion }]
+                    "run_id": run_id,
+                    "head_sha": sha,
+                    "name": name,
+                    "conclusion": conclusion
                 })))
                 .mount(&self.server)
                 .await;
         }
 
-        async fn mock_workflow_jobs_status(&self, status: u16) {
+        async fn mock_gate_workflow_job_lookup(&self, status: u16) {
             Mock::given(method("GET"))
-                .and(path(workflow_jobs_path()))
-                .and(query_param("per_page", "100"))
-                .and(query_param("page", "1"))
+                .and(path(workflow_job_path()))
                 .respond_with(ResponseTemplate::new(status))
                 .mount(&self.server)
                 .await;
@@ -395,7 +530,19 @@ mod integration_tests {
             "allowed_ref": "refs/heads/main",
             "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
+            "release_gate_environment_name": "release-gate",
             "release_gate_job_name": "release-gate",
+            "release_workflow_path": ".github/workflows/release.yml"
+        }))
+        .unwrap()
+    }
+
+    fn test_policy_without_gate_job_name() -> config::Policy {
+        serde_json::from_value(json!({
+            "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
+            "release_environment_name": "release",
+            "release_gate_environment_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
         }))
         .unwrap()
@@ -431,8 +578,20 @@ mod integration_tests {
         format!("/repos/{OWNER}/{REPO}/actions/runs/{RUN_ID}")
     }
 
-    fn workflow_jobs_path() -> String {
-        format!("/repos/{OWNER}/{REPO}/actions/runs/{RUN_ID}/jobs")
+    fn deployments_path() -> String {
+        format!("/repos/{OWNER}/{REPO}/deployments")
+    }
+
+    fn deployment_statuses_path() -> String {
+        deployment_statuses_path_for(GATE_DEPLOYMENT_ID)
+    }
+
+    fn deployment_statuses_path_for(deployment_id: u64) -> String {
+        format!("/repos/{OWNER}/{REPO}/deployments/{deployment_id}/statuses")
+    }
+
+    fn workflow_job_path() -> String {
+        format!("/repos/{OWNER}/{REPO}/actions/jobs/{GATE_JOB_ID}")
     }
 
     fn review_path() -> String {
@@ -670,6 +829,7 @@ mod integration_tests {
             "action": "requested",
             "environment": "release",
             "ref": "main",
+            "sha": SHA,
             "installation": { "id": 1 },
             "repository": {
                 "id": 1,
@@ -704,14 +864,18 @@ mod integration_tests {
         harness
             .mock_workflow_run_path(".github/workflows/release.yml")
             .await;
-        harness.mock_workflow_jobs_success("success").await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
         harness
             .mock_review_response(
                 200,
                 Some(json!({
                     "environment_name": "release",
                     "state": "approved",
-                    "comment": "release-gate passed"
+                    "comment": "release-gate deployment succeeded"
                 })),
             )
             .await;
@@ -725,10 +889,96 @@ mod integration_tests {
         assert_no_content(&response);
 
         let paths = harness.received_paths().await;
-        assert_eq!(paths.len(), 4, "unexpected github calls: {paths:?}");
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
         assert_path_call_count(&paths, &installation_token_path(), 1);
         assert_path_call_count(&paths, &workflow_run_path(), 1);
-        assert_path_call_count(&paths, &workflow_jobs_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_approves_when_an_older_gate_deployment_matches_the_expected_job() {
+        let harness = Harness::new().await;
+        let newer_deployment_id = GATE_DEPLOYMENT_ID + 1;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness
+            .mock_gate_deployments(&[newer_deployment_id, GATE_DEPLOYMENT_ID])
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(deployment_statuses_path_for(newer_deployment_id)))
+            .and(query_param("per_page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "state": "success",
+                    "log_url": format!(
+                        "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
+                    ),
+                    "target_url": format!(
+                        "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
+                    )
+                }
+            ])))
+            .mount(&harness.server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(deployment_statuses_path()))
+            .and(query_param("per_page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "state": "success",
+                    "log_url": format!(
+                        "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                    ),
+                    "target_url": format!(
+                        "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                    )
+                }
+            ])))
+            .mount(&harness.server)
+            .await;
+
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "approved",
+                    "comment": "release-gate deployment succeeded"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 7, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(
+            &paths,
+            &deployment_statuses_path_for(newer_deployment_id),
+            1,
+        );
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
         assert_path_call_count(&paths, &review_path(), 1);
     }
 
@@ -748,14 +998,18 @@ mod integration_tests {
         harness
             .mock_workflow_run_path(".github/workflows/release.yml")
             .await;
-        harness.mock_workflow_jobs_success("success").await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
         harness
             .mock_review_response(
                 200,
                 Some(json!({
                     "environment_name": "release",
                     "state": "approved",
-                    "comment": "release-gate passed"
+                    "comment": "release-gate deployment succeeded"
                 })),
             )
             .await;
@@ -769,10 +1023,12 @@ mod integration_tests {
         assert_no_content(&response);
 
         let paths = harness.received_paths().await;
-        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_eq!(paths.len(), 7, "unexpected github calls: {paths:?}");
         assert_path_call_count(&paths, &installation_token_path(), 2);
         assert_path_call_count(&paths, &workflow_run_path(), 1);
-        assert_path_call_count(&paths, &workflow_jobs_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
         assert_path_call_count(&paths, &review_path(), 1);
     }
 
@@ -784,7 +1040,11 @@ mod integration_tests {
         harness
             .mock_workflow_run_path(".github/workflows/release.yml")
             .await;
-        harness.mock_workflow_jobs_success("success").await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
 
         Mock::given(method("POST"))
             .and(path(review_path()))
@@ -800,7 +1060,7 @@ mod integration_tests {
                 Some(json!({
                     "environment_name": "release",
                     "state": "approved",
-                    "comment": "release-gate passed"
+                    "comment": "release-gate deployment succeeded"
                 })),
             )
             .await;
@@ -814,10 +1074,12 @@ mod integration_tests {
         assert_no_content(&response);
 
         let paths = harness.received_paths().await;
-        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_eq!(paths.len(), 7, "unexpected github calls: {paths:?}");
         assert_path_call_count(&paths, &installation_token_path(), 1);
         assert_path_call_count(&paths, &workflow_run_path(), 1);
-        assert_path_call_count(&paths, &workflow_jobs_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
         assert_path_call_count(&paths, &review_path(), 2);
     }
 
@@ -833,7 +1095,6 @@ mod integration_tests {
                 "push",
             )
             .await;
-        harness.mock_workflow_jobs_success("success").await;
         harness
             .mock_review_response(
                 200,
@@ -854,10 +1115,9 @@ mod integration_tests {
         assert_no_content(&response);
 
         let paths = harness.received_paths().await;
-        assert_eq!(paths.len(), 4, "unexpected github calls: {paths:?}");
+        assert_eq!(paths.len(), 3, "unexpected github calls: {paths:?}");
         assert_path_call_count(&paths, &installation_token_path(), 1);
         assert_path_call_count(&paths, &workflow_run_path(), 1);
-        assert_path_call_count(&paths, &workflow_jobs_path(), 1);
         assert_path_call_count(&paths, &review_path(), 1);
     }
 
@@ -872,7 +1132,6 @@ mod integration_tests {
                 "evil/release-authenticator-example",
             )
             .await;
-        harness.mock_workflow_jobs_success("success").await;
         harness
             .mock_review_response(
                 200,
@@ -893,10 +1152,9 @@ mod integration_tests {
         assert_no_content(&response);
 
         let paths = harness.received_paths().await;
-        assert_eq!(paths.len(), 4, "unexpected github calls: {paths:?}");
+        assert_eq!(paths.len(), 3, "unexpected github calls: {paths:?}");
         assert_path_call_count(&paths, &installation_token_path(), 1);
         assert_path_call_count(&paths, &workflow_run_path(), 1);
-        assert_path_call_count(&paths, &workflow_jobs_path(), 1);
         assert_path_call_count(&paths, &review_path(), 1);
     }
 
@@ -908,7 +1166,6 @@ mod integration_tests {
         harness
             .mock_workflow_run_path(".github/workflows/ci.yml")
             .await;
-        harness.mock_workflow_jobs_success("success").await;
         harness
             .mock_review_response(
                 200,
@@ -929,10 +1186,48 @@ mod integration_tests {
         assert_no_content(&response);
 
         let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 3, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 0);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 0);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_is_missing() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_missing_gate_deployment().await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "no successful deployment to release-gate was found"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
         assert_eq!(paths.len(), 4, "unexpected github calls: {paths:?}");
         assert_path_call_count(&paths, &installation_token_path(), 1);
         assert_path_call_count(&paths, &workflow_run_path(), 1);
-        assert_path_call_count(&paths, &workflow_jobs_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 0);
         assert_path_call_count(&paths, &review_path(), 1);
     }
 
@@ -966,7 +1261,8 @@ mod integration_tests {
         assert_path_call_count(&paths, &installation_token_path(), 1);
         assert_path_call_count(&paths, &review_path(), 1);
         assert_path_call_count(&paths, &workflow_run_path(), 0);
-        assert_path_call_count(&paths, &workflow_jobs_path(), 0);
+        assert_path_call_count(&paths, &deployments_path(), 0);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 0);
     }
 
     #[tokio::test]
@@ -993,19 +1289,20 @@ mod integration_tests {
 
         let paths = harness.received_paths().await;
         assert!(paths.contains(&workflow_run_path()));
-        assert!(!paths.iter().any(|path| path == &workflow_jobs_path()));
+        assert!(!paths.iter().any(|path| path == &deployments_path()));
+        assert!(!paths.iter().any(|path| path == &deployment_statuses_path()));
         assert!(!paths.iter().any(|path| path == &review_path()));
     }
 
     #[tokio::test]
-    async fn webhook_returns_bad_gateway_when_workflow_jobs_lookup_fails() {
+    async fn webhook_returns_bad_gateway_when_deployment_lookup_fails() {
         let harness = Harness::new().await;
 
         harness.mock_installation_token(201).await;
         harness
             .mock_workflow_run_path(".github/workflows/release.yml")
             .await;
-        harness.mock_workflow_jobs_status(500).await;
+        harness.mock_deployment_lookup_status(500).await;
 
         let response = harness
             .dispatch(
@@ -1017,14 +1314,563 @@ mod integration_tests {
         assert_eq!(
             response_json(&response),
             json!({
-                "code": "workflow_jobs_lookup_failed",
-                "error": "github workflow jobs lookup failed"
+                "code": "deployment_lookup_failed",
+                "error": "github deployment lookup failed"
             })
         );
 
         let paths = harness.received_paths().await;
-        assert!(paths.contains(&workflow_jobs_path()));
+        assert!(paths.contains(&deployments_path()));
+        assert!(!paths.iter().any(|path| path == &deployment_statuses_path()));
         assert!(!paths.iter().any(|path| path == &review_path()));
+    }
+
+    #[tokio::test]
+    async fn webhook_returns_bad_gateway_when_deployment_status_lookup_fails() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status_lookup(500).await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response_json(&response),
+            json!({
+                "code": "deployment_lookup_failed",
+                "error": "github deployment lookup failed"
+            })
+        );
+
+        let paths = harness.received_paths().await;
+        assert!(paths.contains(&deployment_statuses_path()));
+        assert!(!paths.iter().any(|path| path == &review_path()));
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_status_lacks_actions_job_url() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness
+            .mock_gate_deployment_status_without_job_url("success")
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "release-gate deployment status is missing a valid actions job url"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 0);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_status_job_urls_disagree() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness
+            .mock_gate_deployment_status_with_mismatched_job_urls("success")
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "release-gate deployment status URLs are inconsistent"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 0);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_status_references_wrong_repository() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness
+            .mock_gate_deployment_status_with_custom_urls(
+                "success",
+                Some(format!(
+                    "https://github.com/octo/tools/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                )),
+                Some(format!(
+                    "https://github.com/octo/tools/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                )),
+            )
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "release-gate deployment status references repository octo/tools, expected zaniebot/release-authenticator-example"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 0);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_status_references_wrong_workflow_run() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness
+            .mock_gate_deployment_status_with_custom_urls(
+                "success",
+                Some(format!(
+                    "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
+                )),
+                Some(format!(
+                    "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
+                )),
+            )
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": format!(
+                        "release-gate deployment status references workflow run 1, expected {RUN_ID}"
+                    )
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 0);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_status_contains_malformed_job_url() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness
+            .mock_gate_deployment_status_with_custom_urls(
+                "success",
+                Some("not-a-valid-url".to_string()),
+                Some(format!(
+                    "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                )),
+            )
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "release-gate deployment status is missing a valid actions job url"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 0);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_job_belongs_to_different_workflow_run() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", 1, SHA)
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": format!(
+                        "release-gate deployment job belongs to workflow run 1, expected {RUN_ID}"
+                    )
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_job_sha_is_unexpected() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, "deadbeef")
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": format!(
+                        "release-gate deployment job sha deadbeef does not match {SHA}"
+                    )
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_job_conclusion_is_not_success() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "failure", RUN_ID, SHA)
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "release-gate deployment job release-gate concluded with failure"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_approves_when_gate_job_name_is_not_configured() {
+        let harness = Harness::new_with_policy(test_policy_without_gate_job_name()).await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("publish", "success", RUN_ID, SHA)
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "approved",
+                    "comment": "release-gate deployment succeeded"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_job_name_is_unexpected() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("publish", "success", RUN_ID, SHA)
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "release-gate deployment job publish does not match expected release-gate"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_returns_bad_gateway_when_workflow_job_lookup_fails() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness.mock_gate_workflow_job_lookup(500).await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response_json(&response),
+            json!({
+                "code": "workflow_job_lookup_failed",
+                "error": "github workflow job lookup failed"
+            })
+        );
+
+        let paths = harness.received_paths().await;
+        assert!(paths.contains(&workflow_job_path()));
+        assert!(!paths.iter().any(|path| path == &review_path()));
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_status_references_missing_workflow_job() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness.mock_gate_workflow_job_lookup(404).await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": format!(
+                        "release-gate deployment status references missing workflow job {GATE_JOB_ID}"
+                    )
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
     }
 
     #[tokio::test]
@@ -1079,14 +1925,18 @@ mod integration_tests {
         harness
             .mock_workflow_run_path(".github/workflows/release.yml")
             .await;
-        harness.mock_workflow_jobs_success("success").await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
 
         Mock::given(method("POST"))
             .and(path(review_path()))
             .and(body_json(json!({
                 "environment_name": "release",
                 "state": "approved",
-                "comment": "release-gate passed"
+                "comment": "release-gate deployment succeeded"
             })))
             .respond_with(ResponseTemplate::new(422).set_body_json(json!({
                 "message": "No pending deployment requests to approve or reject"
@@ -1112,7 +1962,11 @@ mod integration_tests {
         harness
             .mock_workflow_run_path(".github/workflows/release.yml")
             .await;
-        harness.mock_workflow_jobs_success("success").await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
         harness.mock_review_response(500, None).await;
 
         let response = harness

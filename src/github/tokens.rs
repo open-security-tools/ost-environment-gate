@@ -25,6 +25,13 @@ impl Token {
     }
 }
 
+impl AsRef<str> for Token {
+    /// Borrows the token as a string slice.
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl fmt::Debug for Token {
     /// Formats the token using a redacted debug representation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

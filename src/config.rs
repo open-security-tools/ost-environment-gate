@@ -18,7 +18,8 @@ pub struct Policy {
     allowed_ref: GitRef,
     allowed_events: Vec<WorkflowEventName>,
     release_environment_name: EnvironmentName,
-    release_gate_job_name: JobName,
+    release_gate_environment_name: EnvironmentName,
+    release_gate_job_name: Option<JobName>,
     release_workflow_path: WorkflowPath,
 }
 
@@ -27,7 +28,8 @@ struct RawPolicy {
     allowed_ref: String,
     allowed_events: Vec<String>,
     release_environment_name: String,
-    release_gate_job_name: String,
+    release_gate_environment_name: String,
+    release_gate_job_name: Option<String>,
     release_workflow_path: String,
 }
 
@@ -55,7 +57,7 @@ pub enum WorkflowEventName {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EnvironmentName(String);
 
-/// Stores the name of the workflow job that acts as the release gate.
+/// Stores the optional name of the workflow job that must back the gate deployment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobName(String);
 
@@ -271,8 +273,12 @@ impl Policy {
         &self.release_environment_name
     }
 
-    pub fn release_gate_job_name(&self) -> &JobName {
-        &self.release_gate_job_name
+    pub fn release_gate_environment_name(&self) -> &EnvironmentName {
+        &self.release_gate_environment_name
+    }
+
+    pub fn release_gate_job_name(&self) -> Option<&JobName> {
+        self.release_gate_job_name.as_ref()
     }
 
     /// Returns the workflow file path that is allowed to request approval.
@@ -313,7 +319,11 @@ impl TryFrom<RawPolicy> for Policy {
             allowed_ref: raw.allowed_ref.try_into()?,
             allowed_events,
             release_environment_name: raw.release_environment_name.try_into()?,
-            release_gate_job_name: raw.release_gate_job_name.try_into()?,
+            release_gate_environment_name: raw.release_gate_environment_name.try_into()?,
+            release_gate_job_name: raw
+                .release_gate_job_name
+                .map(JobName::try_from)
+                .transpose()?,
             release_workflow_path: raw.release_workflow_path.try_into()?,
         })
     }
@@ -423,7 +433,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitRef, Policy, WorkflowPath};
+    use super::{GitRef, JobName, Policy, WorkflowPath};
     use serde_json::json;
 
     #[test]
@@ -432,7 +442,7 @@ mod tests {
             "allowed_ref": "refs/heads/main",
             "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
-            "release_gate_job_name": "release-gate",
+            "release_gate_environment_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
         }))
         .unwrap();
@@ -441,7 +451,11 @@ mod tests {
         assert!(policy.allows_event("workflow_dispatch"));
         assert!(!policy.allows_event("push"));
         assert_eq!(policy.release_environment_name().as_str(), "release");
-        assert_eq!(policy.release_gate_job_name().as_str(), "release-gate");
+        assert_eq!(
+            policy.release_gate_environment_name().as_str(),
+            "release-gate"
+        );
+        assert_eq!(policy.release_gate_job_name(), None);
         assert_eq!(
             policy.release_workflow_path().as_str(),
             ".github/workflows/release.yml"
@@ -454,7 +468,7 @@ mod tests {
             "allowed_ref": "refs/heads/main",
             "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
-            "release_gate_job_name": "release-gate",
+            "release_gate_environment_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
         }"#
         .parse()
@@ -485,11 +499,25 @@ mod tests {
             "allowed_ref": "refs/heads/main",
             "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "",
-            "release_gate_job_name": "release-gate",
+            "release_gate_environment_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
         }));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn policy_accepts_optional_gate_job_name() {
+        let policy: Policy = serde_json::from_value(json!({
+            "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
+            "release_environment_name": "release",
+            "release_gate_environment_name": "release-gate",
+            "release_workflow_path": ".github/workflows/release.yml"
+        }))
+        .unwrap();
+
+        assert_eq!(policy.release_gate_job_name().map(JobName::as_str), None);
     }
 
     #[test]

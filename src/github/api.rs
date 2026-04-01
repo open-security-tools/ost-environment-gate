@@ -66,9 +66,12 @@ impl TryFrom<String> for GithubApiBase {
 }
 
 /// Adds the standard GitHub API authentication and version headers to a request.
-pub fn github_request(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+pub fn github_request(
+    builder: reqwest::RequestBuilder,
+    token: impl AsRef<str>,
+) -> reqwest::RequestBuilder {
     builder
-        .bearer_auth(token)
+        .bearer_auth(token.as_ref())
         .header("accept", "application/vnd.github+json")
         .header("x-github-api-version", GITHUB_API_VERSION)
 }
