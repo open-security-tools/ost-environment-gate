@@ -85,7 +85,7 @@ pub async fn handle_deployment_protection_rule_webhook(
         });
     }
 
-    let requested = RequestedDeploymentProtection::try_from(payload)?;
+    let requested = RequestedDeploymentProtection::parse(payload, &config.github_api_base)?;
     let app_jwt = github::create_app_jwt(&config.app_id, &config.app_private_key)?;
 
     let installation_token = github::mint_installation_token(

@@ -83,6 +83,35 @@ impl DeploymentCallbackUrl {
     pub fn as_url(&self) -> &reqwest::Url {
         &self.0
     }
+
+    /// Parses and validates a deployment callback URL, ensuring its origin
+    /// (scheme + host + port) matches the configured GitHub API base URL.
+    pub fn parse_validated(
+        value: String,
+        expected_base: &GithubApiBase,
+    ) -> Result<Self, AppError> {
+        let value = value.trim().to_string();
+        if value.is_empty() {
+            return Err(AppError::DeploymentProtectionPayloadInvalid);
+        }
+        let url = reqwest::Url::parse(&value)
+            .map_err(|_| AppError::DeploymentProtectionPayloadInvalid)?;
+
+        let expected = expected_base.as_url();
+        if url.scheme() != expected.scheme()
+            || url.host_str() != expected.host_str()
+            || url.port() != expected.port()
+        {
+            tracing::warn!(
+                callback_origin = %url.origin().ascii_serialization(),
+                expected_origin = %expected.origin().ascii_serialization(),
+                "deployment callback URL origin does not match configured GitHub API base"
+            );
+            return Err(AppError::DeploymentProtectionPayloadInvalid);
+        }
+
+        Ok(Self(url))
+    }
 }
 
 impl RefName {
@@ -92,11 +121,17 @@ impl RefName {
     }
 }
 
-impl TryFrom<DeploymentProtectionRulePayload> for RequestedDeploymentProtection {
-    type Error = AppError;
-
+impl RequestedDeploymentProtection {
     /// Validates a raw GitHub deployment protection payload into a rule request.
-    fn try_from(payload: DeploymentProtectionRulePayload) -> Result<Self, Self::Error> {
+    ///
+    /// When the `workflow_run.id` field is missing and the run ID must be
+    /// extracted from the `deployment_callback_url`, the callback URL's origin
+    /// is verified against `github_api_base` to prevent accepting IDs from
+    /// URLs pointing to unexpected hosts.
+    pub fn parse(
+        payload: DeploymentProtectionRulePayload,
+        github_api_base: &GithubApiBase,
+    ) -> Result<Self, AppError> {
         if payload.action.as_deref() != Some(REQUESTED_ACTION) {
             return Err(AppError::DeploymentProtectionPayloadInvalid);
         }
@@ -138,7 +173,9 @@ impl TryFrom<DeploymentProtectionRulePayload> for RequestedDeploymentProtection 
                 let deployment_callback_url = payload
                     .deployment_callback_url
                     .ok_or(AppError::DeploymentProtectionPayloadInvalid)
-                    .and_then(DeploymentCallbackUrl::try_from)?;
+                    .and_then(|url| {
+                        DeploymentCallbackUrl::parse_validated(url, github_api_base)
+                    })?;
                 RunId::try_from(&deployment_callback_url)?
             }
         };
@@ -259,8 +296,12 @@ mod tests {
         RequestedDeploymentProtection,
     };
     use crate::config::{GitRef, Policy};
-    use crate::github::RunId;
+    use crate::github::{GithubApiBase, RunId};
     use serde_json::json;
+
+    fn test_github_api_base() -> GithubApiBase {
+        GithubApiBase::try_from(String::from("https://api.github.com")).unwrap()
+    }
 
     fn test_policy() -> Policy {
         serde_json::from_value(json!({
@@ -341,7 +382,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(RequestedDeploymentProtection::try_from(payload).is_err());
+        assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
     }
 
     #[test]
@@ -354,7 +395,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(RequestedDeploymentProtection::try_from(payload).is_err());
+        assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
     }
 
     #[test]
@@ -367,16 +408,17 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(RequestedDeploymentProtection::try_from(payload).is_err());
+        assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
     }
 
     #[test]
-    fn requested_deployment_protection_try_from_accepts_real_payload_shape() {
+    fn requested_deployment_protection_parse_accepts_real_payload_shape() {
         let payload: DeploymentProtectionRulePayload = serde_json::from_str(include_str!(
             "../../testdata/deployment-protection-requested.json"
         ))
         .unwrap();
-        let requested = RequestedDeploymentProtection::try_from(payload).unwrap();
+        let requested =
+            RequestedDeploymentProtection::parse(payload, &test_github_api_base()).unwrap();
 
         assert_eq!(requested.environment.as_str(), "release");
         assert_eq!(
@@ -412,5 +454,64 @@ mod tests {
         assert!(!RefName::try_from("develop")
             .unwrap()
             .matches_allowed_ref(test_policy().allowed_ref()));
+    }
+
+    #[test]
+    fn callback_url_parse_validated_accepts_matching_origin() {
+        let base =
+            GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
+        let url = DeploymentCallbackUrl::parse_validated(
+            "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+                .to_string(),
+            &base,
+        );
+        assert!(url.is_ok());
+    }
+
+    #[test]
+    fn callback_url_parse_validated_rejects_different_host() {
+        let base =
+            GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
+        let url = DeploymentCallbackUrl::parse_validated(
+            "https://evil.example.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+                .to_string(),
+            &base,
+        );
+        assert!(url.is_err());
+    }
+
+    #[test]
+    fn callback_url_parse_validated_rejects_http_when_https_expected() {
+        let base =
+            GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
+        let url = DeploymentCallbackUrl::parse_validated(
+            "http://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+                .to_string(),
+            &base,
+        );
+        assert!(url.is_err());
+    }
+
+    #[test]
+    fn callback_url_parse_validated_rejects_different_port() {
+        let base = GithubApiBase::try_from(String::from("http://localhost:8080")).unwrap();
+        let url = DeploymentCallbackUrl::parse_validated(
+            "http://localhost:9999/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+                .to_string(),
+            &base,
+        );
+        assert!(url.is_err());
+    }
+
+    #[test]
+    fn callback_url_parse_validated_accepts_matching_ghe_origin() {
+        let base =
+            GithubApiBase::try_from(String::from("https://ghe.corp.example.com/api/v3")).unwrap();
+        let url = DeploymentCallbackUrl::parse_validated(
+            "https://ghe.corp.example.com/api/v3/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+                .to_string(),
+            &base,
+        );
+        assert!(url.is_ok());
     }
 }
