@@ -937,6 +937,39 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn webhook_treats_idempotent_422_review_submission_as_success() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_workflow_jobs_success("success").await;
+
+        Mock::given(method("POST"))
+            .and(path(review_path()))
+            .and(body_json(json!({
+                "environment_name": "release",
+                "state": "approved",
+                "comment": "release-gate passed"
+            })))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "No pending deployment requests to approve or reject"
+            })))
+            .expect(1)
+            .mount(&harness.server)
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+    }
+
+    #[tokio::test]
     async fn webhook_returns_bad_gateway_when_review_submission_fails() {
         let harness = Harness::new().await;
 
