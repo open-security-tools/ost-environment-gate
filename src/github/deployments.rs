@@ -224,19 +224,115 @@ pub async fn review_deployment_protection_rule(
         AppError::DeploymentProtectionReviewFailed
     })?;
 
-    if !response.status().is_success() {
-        tracing::error!(status = %response.status(), "unexpected deployment protection review status");
-        return Err(AppError::DeploymentProtectionReviewFailed);
+    if response.status().is_success() {
+        return Ok(());
     }
 
-    Ok(())
+    let status = response.status();
+    let response_body = response.text().await.map_err(|error| {
+        tracing::error!(
+            ?error,
+            status = %status,
+            "failed to read deployment protection review error response body"
+        );
+        AppError::DeploymentProtectionReviewFailed
+    })?;
+
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        if let Some(reason) = idempotent_review_422_reason(&response_body) {
+            tracing::warn!(
+                status = %status,
+                reason = %reason,
+                response_body = %response_body,
+                "deployment protection review already processed; treating status as success"
+            );
+            return Ok(());
+        }
+    }
+
+    tracing::error!(
+        status = %status,
+        response_body = %response_body,
+        "unexpected deployment protection review status"
+    );
+    Err(AppError::DeploymentProtectionReviewFailed)
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiErrorResponse {
+    pub message: Option<String>,
+    pub errors: Option<Vec<GithubApiErrorDetail>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiErrorDetail {
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdempotentReview422Reason {
+    NoPendingDeploymentRequests,
+    AlreadyReviewed,
+}
+
+impl std::fmt::Display for IdempotentReview422Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoPendingDeploymentRequests => "no_pending_deployment_requests",
+            Self::AlreadyReviewed => "already_reviewed",
+        })
+    }
+}
+
+impl std::str::FromStr for IdempotentReview422Reason {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize_github_error_message(value).as_str() {
+            "no pending deployment requests to approve or reject" => {
+                Ok(Self::NoPendingDeploymentRequests)
+            }
+            "deployment protection rule has already been reviewed" => Ok(Self::AlreadyReviewed),
+            _ => Err(()),
+        }
+    }
+}
+
+fn normalize_github_error_message(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn idempotent_review_422_reason(body: &str) -> Option<IdempotentReview422Reason> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let payload: GithubApiErrorResponse = serde_json::from_str(body).ok()?;
+
+    payload
+        .message
+        .iter()
+        .map(String::as_str)
+        .chain(
+            payload
+                .errors
+                .iter()
+                .flatten()
+                .filter_map(|error| error.message.as_deref()),
+        )
+        .find_map(|message| message.parse::<IdempotentReview422Reason>().ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DeploymentCallbackUrl, DeploymentProtectionRulePayload, RefName,
-        RequestedDeploymentProtection,
+        idempotent_review_422_reason, DeploymentCallbackUrl, DeploymentProtectionRulePayload,
+        RefName, RequestedDeploymentProtection,
     };
     use crate::config::{GitRef, Policy};
     use crate::error::AppError;
@@ -454,5 +550,60 @@ mod tests {
             &base,
         );
         assert!(url.is_ok());
+    }
+
+    #[test]
+    fn idempotent_422_detector_accepts_already_reviewed_errors() {
+        let body = json!({
+            "message": "Validation Failed",
+            "errors": [
+                {
+                    "message": "Deployment protection rule has already been reviewed"
+                }
+            ]
+        })
+        .to_string();
+
+        assert!(idempotent_review_422_reason(&body).is_some());
+    }
+
+    #[test]
+    fn idempotent_422_detector_accepts_no_pending_deployments_errors() {
+        let body = json!({
+            "message": "No pending deployment requests to approve or reject"
+        })
+        .to_string();
+
+        assert!(idempotent_review_422_reason(&body).is_some());
+    }
+
+    #[test]
+    fn idempotent_422_detector_rejects_non_idempotent_validation_errors() {
+        let body = json!({
+            "message": "Validation Failed",
+            "errors": [
+                {
+                    "message": "Environment name is invalid"
+                }
+            ]
+        })
+        .to_string();
+
+        assert!(idempotent_review_422_reason(&body).is_none());
+    }
+
+    #[test]
+    fn idempotent_422_detector_rejects_non_json_body() {
+        assert!(idempotent_review_422_reason("unprocessable").is_none());
+    }
+
+    #[test]
+    fn idempotent_422_detector_accepts_whitespace_and_case_differences() {
+        let body = json!({
+            "message": "  No  Pending   Deployment Requests To Approve Or Reject  "
+        })
+        .to_string();
+
+        assert!(idempotent_review_422_reason(&body).is_some());
     }
 }
