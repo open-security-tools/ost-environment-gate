@@ -110,7 +110,10 @@ pub async fn handle_deployment_protection_rule_webhook(
     {
         evaluate_release_protection(
             &requested,
-            &WorkflowRunSummary { path: None },
+            &WorkflowRunSummary {
+                path: None,
+                head_repository: None,
+            },
             &[],
             &config.policy,
         )
@@ -189,6 +192,23 @@ pub fn evaluate_release_protection(
         ));
     }
 
+    let head_repository_name = workflow_run
+        .head_repository
+        .as_ref()
+        .and_then(|repository| repository.full_name.as_deref());
+    let head_repository = head_repository_name
+        .map(str::to_owned)
+        .map(Repository::try_from)
+        .transpose()
+        .ok()
+        .flatten();
+    if head_repository.as_ref() != Some(&requested.repository) {
+        return ReleaseProtectionDecision::rejected(format!(
+            "workflow run head repository {} is not allowed",
+            head_repository_name.unwrap_or("<missing>")
+        ));
+    }
+
     if workflow_run.path.as_deref() != Some(policy.release_workflow_path().as_str()) {
         return ReleaseProtectionDecision::rejected(format!(
             "workflow path {} is not allowed",
@@ -264,6 +284,20 @@ mod tests {
         RequestedDeploymentProtection::parse(payload, &base).unwrap()
     }
 
+    fn workflow_run(path: &str) -> WorkflowRunSummary {
+        workflow_run_from_repo(path, "zaniebot/release-authenticator-example")
+    }
+
+    fn workflow_run_from_repo(path: &str, full_name: &str) -> WorkflowRunSummary {
+        serde_json::from_value(json!({
+            "path": path,
+            "head_repository": {
+                "full_name": full_name,
+            },
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn git_ref_name_extracts_branch_and_tag_names() {
         assert_eq!(
@@ -295,9 +329,7 @@ mod tests {
     fn evaluate_release_protection_rejects_missing_ref() {
         let decision = evaluate_release_protection(
             &test_requested("release", None),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/release.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/release.yml"),
             &[WorkflowJobSummary {
                 name: "release-gate".to_string(),
                 conclusion: Some(Conclusion::Success),
@@ -313,9 +345,7 @@ mod tests {
     fn evaluate_release_protection_rejects_no_conclusion() {
         let decision = evaluate_release_protection(
             &test_requested("release", Some("main")),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/release.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/release.yml"),
             &[WorkflowJobSummary {
                 name: "release-gate".to_string(),
                 conclusion: None,
@@ -342,9 +372,7 @@ mod tests {
 
         let decision = evaluate_release_protection(
             &test_requested("release", Some("main")),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/release.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/release.yml"),
             &jobs,
             &test_policy(),
         );
@@ -354,12 +382,32 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_release_protection_rejects_fork_repository() {
+        let decision = evaluate_release_protection(
+            &test_requested("release", Some("main")),
+            &workflow_run_from_repo(
+                ".github/workflows/release.yml",
+                "evil/release-authenticator-example",
+            ),
+            &[WorkflowJobSummary {
+                name: "release-gate".to_string(),
+                conclusion: Some(Conclusion::Success),
+            }],
+            &test_policy(),
+        );
+
+        assert_eq!(decision.state, ReleaseProtectionState::Rejected);
+        assert_eq!(
+            decision.comment,
+            "workflow run head repository evil/release-authenticator-example is not allowed"
+        );
+    }
+
+    #[test]
     fn evaluate_release_protection_rejects_wrong_workflow_path() {
         let decision = evaluate_release_protection(
             &test_requested("release", Some("main")),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/ci.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/ci.yml"),
             &[WorkflowJobSummary {
                 name: "release-gate".to_string(),
                 conclusion: Some(Conclusion::Success),
@@ -375,9 +423,7 @@ mod tests {
     fn evaluate_release_protection_rejects_missing_gate_job() {
         let decision = evaluate_release_protection(
             &test_requested("release", Some("main")),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/release.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/release.yml"),
             &[WorkflowJobSummary {
                 name: "publish".to_string(),
                 conclusion: Some(Conclusion::Success),
@@ -393,9 +439,7 @@ mod tests {
     fn evaluate_release_protection_rejects_failed_gate_job() {
         let decision = evaluate_release_protection(
             &test_requested("release", Some("main")),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/release.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/release.yml"),
             &[WorkflowJobSummary {
                 name: "release-gate".to_string(),
                 conclusion: Some(Conclusion::Failure),
@@ -411,9 +455,7 @@ mod tests {
     fn evaluate_release_protection_rejects_wrong_environment() {
         let decision = evaluate_release_protection(
             &test_requested("staging", Some("main")),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/release.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/release.yml"),
             &[WorkflowJobSummary {
                 name: "release-gate".to_string(),
                 conclusion: Some(Conclusion::Success),
@@ -429,9 +471,7 @@ mod tests {
     fn evaluate_release_protection_rejects_wrong_ref() {
         let decision = evaluate_release_protection(
             &test_requested("release", Some("refs/tags/v1.2.3")),
-            &WorkflowRunSummary {
-                path: Some(".github/workflows/release.yml".to_string()),
-            },
+            &workflow_run(".github/workflows/release.yml"),
             &[WorkflowJobSummary {
                 name: "release-gate".to_string(),
                 conclusion: Some(Conclusion::Success),

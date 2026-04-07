@@ -94,7 +94,7 @@ The webhook lifecycle is roughly:
 1. Use the private key to mint a JWT
 1. Exchange the JWT for a GitHub access token (`POST /app/installations/{id}/access_tokens`)
 1. Extract the workflow run id from the event
-1. Validate that the workflow run comes from the expected workflow file (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`)
+1. Validate that the workflow run comes from the same repository and expected workflow file (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`)
 1. Read the workflow jobs for the run (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`)
 1. Find the release gate job and check that it succeeded
 1. Approve or deny the deployment (`POST /repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule`)
