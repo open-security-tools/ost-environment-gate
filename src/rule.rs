@@ -253,7 +253,7 @@ pub fn evaluate_release_protection(
 mod tests {
     use super::{evaluate_release_protection, ReleaseProtectionState};
     use crate::{
-        config::{GitRef, Policy},
+        config::Policy,
         github::{
             Conclusion, DeploymentProtectionRulePayload, GithubApiBase,
             RequestedDeploymentProtection, WorkflowJobSummary, WorkflowRunSummary,
@@ -319,22 +319,6 @@ mod tests {
             },
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn git_ref_name_extracts_branch_and_tag_names() {
-        assert_eq!(
-            GitRef::try_from(String::from("refs/heads/main"))
-                .unwrap()
-                .name(),
-            "main"
-        );
-        assert_eq!(
-            GitRef::try_from(String::from("refs/tags/v1.0"))
-                .unwrap()
-                .name(),
-            "v1.0"
-        );
     }
 
     #[test]

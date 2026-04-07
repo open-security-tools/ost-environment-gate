@@ -131,7 +131,14 @@ impl DeploymentCallbackUrl {
 impl RefName {
     /// Reports whether this ref matches the configured allowed ref in short or full form.
     pub fn matches_allowed_ref(&self, allowed_ref: &GitRef) -> bool {
-        self.as_str() == allowed_ref.as_str() || self.as_str() == allowed_ref.name()
+        let allowed = allowed_ref.as_str();
+        self.as_str() == allowed
+            || allowed
+                .strip_prefix("refs/heads/")
+                .is_some_and(|short_name| self.as_str() == short_name)
+            || allowed
+                .strip_prefix("refs/tags/")
+                .is_some_and(|short_name| self.as_str() == short_name)
     }
 }
 

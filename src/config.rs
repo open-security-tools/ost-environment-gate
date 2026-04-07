@@ -112,15 +112,6 @@ crate::impl_string_newtype!(
     AppError::WebhookSecretNotConfigured
 );
 
-impl GitRef {
-    pub fn name(&self) -> &str {
-        self.as_str()
-            .strip_prefix("refs/heads/")
-            .or_else(|| self.as_str().strip_prefix("refs/tags/"))
-            .expect("GitRef always has a refs/heads/ or refs/tags/ prefix")
-    }
-}
-
 impl WorkflowEventName {
     /// Returns the canonical GitHub event name.
     pub fn as_str(self) -> &'static str {
@@ -176,7 +167,6 @@ impl fmt::Display for WorkflowEventName {
         f.write_str(self.as_str())
     }
 }
-
 impl fmt::Debug for AppPrivateKey {
     /// Formats the private key using a redacted debug representation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
