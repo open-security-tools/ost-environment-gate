@@ -298,9 +298,10 @@ mod integration_tests {
         }
 
         async fn mock_workflow_run_path(&self, workflow_path: &str) {
-            self.mock_workflow_run_path_and_head_repository(
+            self.mock_workflow_run_summary(
                 workflow_path,
                 &format!("{OWNER}/{REPO}"),
+                "workflow_dispatch",
             )
             .await;
         }
@@ -310,10 +311,25 @@ mod integration_tests {
             workflow_path: &str,
             head_repository_full_name: &str,
         ) {
+            self.mock_workflow_run_summary(
+                workflow_path,
+                head_repository_full_name,
+                "workflow_dispatch",
+            )
+            .await;
+        }
+
+        async fn mock_workflow_run_summary(
+            &self,
+            workflow_path: &str,
+            head_repository_full_name: &str,
+            event: &str,
+        ) {
             Mock::given(method("GET"))
                 .and(path(workflow_run_path()))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "path": workflow_path,
+                    "event": event,
                     "head_repository": {
                         "full_name": head_repository_full_name,
                     }
@@ -377,6 +393,7 @@ mod integration_tests {
     fn test_policy() -> config::Policy {
         serde_json::from_value(json!({
             "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
             "release_gate_job_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
@@ -778,6 +795,46 @@ mod integration_tests {
         assert_path_call_count(&paths, &workflow_run_path(), 1);
         assert_path_call_count(&paths, &workflow_jobs_path(), 1);
         assert_path_call_count(&paths, &review_path(), 2);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_workflow_run_event_is_unexpected() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_summary(
+                ".github/workflows/release.yml",
+                &format!("{OWNER}/{REPO}"),
+                "push",
+            )
+            .await;
+        harness.mock_workflow_jobs_success("success").await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "workflow run event push is not allowed"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 4, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &workflow_jobs_path(), 1);
+        assert_path_call_count(&paths, &review_path(), 1);
     }
 
     #[tokio::test]
