@@ -108,10 +108,14 @@ The deployment protection rule approves `release` only when all of these checks 
 
 1. The requested environment matches `release_environment_name`
 1. The requested Git ref matches `allowed_ref`
+1. The workflow run event is included in `allowed_events`
 1. The workflow run path matches `release_workflow_path`
+1. The callback URL is exactly the expected deployment-protection review endpoint for the same repository and workflow run
+1. The workflow run head repository matches the requesting repository (fork runs are rejected)
 1. There is a successful deployment to `release_gate_environment_name` for the same commit SHA
-1. The successful gate deployment status points at a GitHub Actions job for the same repository, workflow run, and commit SHA
-1. That referenced job completed successfully
+1. The successful gate deployment status points at a valid GitHub Actions job URL
+1. The referenced job belongs to the same repository, workflow run, and commit SHA
+1. The referenced job completed successfully
 1. If `release_gate_job_name` is configured, the referenced job name matches it
 
 Example policy:
@@ -119,6 +123,7 @@ Example policy:
 ```json
 {
   "allowed_ref": "refs/heads/main",
+  "allowed_events": ["workflow_dispatch"],
   "release_environment_name": "release",
   "release_gate_environment_name": "release-gate",
   "release_gate_job_name": "release-gate",
