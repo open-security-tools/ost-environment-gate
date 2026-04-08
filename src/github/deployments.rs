@@ -102,6 +102,20 @@ impl DeploymentCallbackUrl {
         Ok(Self(url))
     }
 
+    /// Extracts the workflow run id from the deployment callback URL path.
+    pub fn run_id(&self) -> Option<RunId> {
+        let segments = self.0.path_segments()?.collect::<Vec<_>>();
+
+        segments.windows(7).find_map(|window| {
+            (window[0] == "repos"
+                && window[3] == "actions"
+                && window[4] == "runs"
+                && window[6] == "deployment_protection_rule")
+                .then(|| window[5].parse::<u64>().ok().and_then(RunId::new))
+                .flatten()
+        })
+    }
+
     /// Builds the exact deployment callback URL expected for the validated
     /// repository and workflow run.
     pub fn expected_for_run(
@@ -178,11 +192,25 @@ impl RequestedDeploymentProtection {
             _ => return Err(AppError::DeploymentProtectionPayloadInvalid),
         };
 
-        let run_id = payload
+        // For `deployment_protection_rule` webhooks, GitHub does not consistently
+        // populate `workflow_run.id`. The callback URL always embeds the run id,
+        // so treat that as the source of truth.
+        let run_id = deployment_callback_url
+            .run_id()
+            .ok_or(AppError::DeploymentProtectionRunIdInvalid)?;
+
+        let payload_workflow_run_id = payload
             .workflow_run
             .and_then(|workflow_run| workflow_run.id)
-            .and_then(RunId::new)
-            .ok_or(AppError::DeploymentProtectionRunIdInvalid)?;
+            .and_then(RunId::new);
+        if payload_workflow_run_id.is_some_and(|payload_run_id| payload_run_id != run_id) {
+            tracing::warn!(
+                callback_run_id = %run_id,
+                payload_run_id = ?payload_workflow_run_id,
+                "workflow_run.id does not match callback URL run id"
+            );
+            return Err(AppError::DeploymentProtectionPayloadInvalid);
+        }
 
         let expected_deployment_callback_url =
             DeploymentCallbackUrl::expected_for_run(github_api_base, &repository, run_id)?;
@@ -458,13 +486,29 @@ mod tests {
     }
 
     #[test]
-    fn requested_deployment_protection_rejects_missing_workflow_run_id() {
+    fn requested_deployment_protection_uses_callback_url_run_id_when_workflow_run_is_missing() {
         let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
             "action": "requested",
             "environment": "release",
             "installation": { "id": 1 },
             "repository": { "id": 1, "full_name": "octo/tools" },
             "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
+        }))
+        .unwrap();
+
+        let requested =
+            RequestedDeploymentProtection::parse(payload, &test_github_api_base()).unwrap();
+        assert_eq!(*requested.run_id, 1);
+    }
+
+    #[test]
+    fn requested_deployment_protection_rejects_callback_url_without_valid_run_id() {
+        let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
+            "action": "requested",
+            "environment": "release",
+            "installation": { "id": 1 },
+            "repository": { "id": 1, "full_name": "octo/tools" },
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/not-a-number/deployment_protection_rule"
         }))
         .unwrap();
 
