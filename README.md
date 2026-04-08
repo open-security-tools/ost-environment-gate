@@ -95,7 +95,36 @@ The webhook lifecycle is roughly:
 1. Exchange the JWT for a GitHub access token (`POST /app/installations/{id}/access_tokens`)
 1. Extract the workflow run id from the event
 1. Validate that the workflow run comes from the same repository, expected event, and expected workflow file (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`)
-1. Read the workflow jobs for the run (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`)
-1. Find the release gate job and check that it succeeded
+1. Look up deployments for the configured gate environment and the same commit SHA (`GET /repos/{owner}/{repo}/deployments`)
+1. Read the latest status for the matching gate deployment (`GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses`)
+1. Parse the deployment status `log_url` / `target_url` and resolve the referenced job (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`)
+1. Verify the referenced job belongs to the same repository, workflow run, and commit SHA, and that it completed successfully
 1. Approve or deny the deployment (`POST /repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule`)
 1. Return an HTTP 204
+
+## Policy
+
+The deployment protection rule approves `release` only when all of these checks pass:
+
+1. The requested environment matches `release_environment_name`
+1. The requested Git ref matches `allowed_ref`
+1. The workflow run path matches `release_workflow_path`
+1. There is a successful deployment to `release_gate_environment_name` for the same commit SHA
+1. The successful gate deployment status points at a GitHub Actions job for the same repository, workflow run, and commit SHA
+1. That referenced job completed successfully
+1. If `release_gate_job_name` is configured, the referenced job name matches it
+
+Example policy:
+
+```json
+{
+  "allowed_ref": "refs/heads/main",
+  "release_environment_name": "release",
+  "release_gate_environment_name": "release-gate",
+  "release_gate_job_name": "release-gate",
+  "release_workflow_path": ".github/workflows/release.yml"
+}
+```
+
+`release_gate_job_name` is optional. When omitted, any successful gate job for the expected run and
+commit SHA is accepted.
