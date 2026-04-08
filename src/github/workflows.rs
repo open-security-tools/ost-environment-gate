@@ -9,10 +9,17 @@ use crate::{
 
 id_type!(RunId);
 
+/// Captures the repository that a workflow run executed from.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowRunRepositorySummary {
+    pub full_name: Option<String>,
+}
+
 /// Captures the subset of workflow run metadata needed by the release rule.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowRunSummary {
     pub path: Option<String>,
+    pub head_repository: Option<WorkflowRunRepositorySummary>,
 }
 
 /// Represents the possible conclusions GitHub can report for a workflow job.
