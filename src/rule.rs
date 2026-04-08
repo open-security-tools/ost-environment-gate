@@ -112,6 +112,7 @@ pub async fn handle_deployment_protection_rule_webhook(
             &requested,
             &WorkflowRunSummary {
                 path: None,
+                event: None,
                 head_repository: None,
             },
             &[],
@@ -209,6 +210,14 @@ pub fn evaluate_release_protection(
         ));
     }
 
+    let workflow_event = workflow_run.event.as_deref();
+    if !workflow_event.is_some_and(|event| policy.allows_event(event)) {
+        return ReleaseProtectionDecision::rejected(format!(
+            "workflow run event {} is not allowed",
+            workflow_event.unwrap_or("<missing>")
+        ));
+    }
+
     if workflow_run.path.as_deref() != Some(policy.release_workflow_path().as_str()) {
         return ReleaseProtectionDecision::rejected(format!(
             "workflow path {} is not allowed",
@@ -255,6 +264,7 @@ mod tests {
     fn test_policy() -> Policy {
         serde_json::from_value(json!({
             "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
             "release_gate_job_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
@@ -285,12 +295,25 @@ mod tests {
     }
 
     fn workflow_run(path: &str) -> WorkflowRunSummary {
-        workflow_run_from_repo(path, "zaniebot/release-authenticator-example")
+        workflow_run_from_repo_and_event(
+            path,
+            "zaniebot/release-authenticator-example",
+            Some("workflow_dispatch"),
+        )
     }
 
     fn workflow_run_from_repo(path: &str, full_name: &str) -> WorkflowRunSummary {
+        workflow_run_from_repo_and_event(path, full_name, Some("workflow_dispatch"))
+    }
+
+    fn workflow_run_from_repo_and_event(
+        path: &str,
+        full_name: &str,
+        event: Option<&str>,
+    ) -> WorkflowRunSummary {
         serde_json::from_value(json!({
             "path": path,
+            "event": event,
             "head_repository": {
                 "full_name": full_name,
             },
@@ -401,6 +424,26 @@ mod tests {
             decision.comment,
             "workflow run head repository evil/release-authenticator-example is not allowed"
         );
+    }
+
+    #[test]
+    fn evaluate_release_protection_rejects_unexpected_workflow_event() {
+        let decision = evaluate_release_protection(
+            &test_requested("release", Some("main")),
+            &workflow_run_from_repo_and_event(
+                ".github/workflows/release.yml",
+                "zaniebot/release-authenticator-example",
+                Some("push"),
+            ),
+            &[WorkflowJobSummary {
+                name: "release-gate".to_string(),
+                conclusion: Some(Conclusion::Success),
+            }],
+            &test_policy(),
+        );
+
+        assert_eq!(decision.state, ReleaseProtectionState::Rejected);
+        assert_eq!(decision.comment, "workflow run event push is not allowed");
     }
 
     #[test]

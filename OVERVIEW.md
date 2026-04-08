@@ -59,11 +59,11 @@
  │ src/config.rs    │   │ src/config.rs        │                          │ src/error.rs       │
  │------------------│   │----------------------│                          │--------------------│
  │ allowed_ref      │   │ app_id               │                          │ shared error enum  │
- │ env name         │   │ app_private_key      │                          │ + http status/code │
- │ gate job         │   │ webhook_secret       │                          └────────────────────┘
- │ workflow path    │   │ github_api_base      │
- └──────────────────┘   │ http_client          │
-                        └──────────────────────┘
+ │ allowed_events   │   │ app_private_key      │                          │ + http status/code │
+ │ env name         │   │ webhook_secret       │                          └────────────────────┘
+ │ gate job         │   │ github_api_base      │
+ │ workflow path    │   │ http_client          │
+ └──────────────────┘   └──────────────────────┘
 
                                      GitHub API layer
                                            │

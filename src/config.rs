@@ -16,6 +16,7 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 #[serde(try_from = "RawPolicy")]
 pub struct Policy {
     allowed_ref: GitRef,
+    allowed_events: Vec<WorkflowEventName>,
     release_environment_name: EnvironmentName,
     release_gate_job_name: JobName,
     release_workflow_path: WorkflowPath,
@@ -24,6 +25,7 @@ pub struct Policy {
 #[derive(Debug, Deserialize)]
 struct RawPolicy {
     allowed_ref: String,
+    allowed_events: Vec<String>,
     release_environment_name: String,
     release_gate_job_name: String,
     release_workflow_path: String,
@@ -33,6 +35,22 @@ struct RawPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitRef(String);
 
+/// Enumerates GitHub Actions workflow event names that can trigger releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowEventName {
+    WorkflowDispatch,
+    WorkflowCall,
+    WorkflowRun,
+    Push,
+    PullRequest,
+    PullRequestTarget,
+    RepositoryDispatch,
+    Release,
+    Schedule,
+    MergeGroup,
+    Create,
+    Delete,
+}
 /// Stores the name of the protected deployment environment.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EnvironmentName(String);
@@ -100,6 +118,62 @@ impl GitRef {
             .strip_prefix("refs/heads/")
             .or_else(|| self.as_str().strip_prefix("refs/tags/"))
             .expect("GitRef always has a refs/heads/ or refs/tags/ prefix")
+    }
+}
+
+impl WorkflowEventName {
+    /// Returns the canonical GitHub event name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkflowDispatch => "workflow_dispatch",
+            Self::WorkflowCall => "workflow_call",
+            Self::WorkflowRun => "workflow_run",
+            Self::Push => "push",
+            Self::PullRequest => "pull_request",
+            Self::PullRequestTarget => "pull_request_target",
+            Self::RepositoryDispatch => "repository_dispatch",
+            Self::Release => "release",
+            Self::Schedule => "schedule",
+            Self::MergeGroup => "merge_group",
+            Self::Create => "create",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+impl TryFrom<String> for WorkflowEventName {
+    type Error = AppError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.trim() {
+            "workflow_dispatch" => Ok(Self::WorkflowDispatch),
+            "workflow_call" => Ok(Self::WorkflowCall),
+            "workflow_run" => Ok(Self::WorkflowRun),
+            "push" => Ok(Self::Push),
+            "pull_request" => Ok(Self::PullRequest),
+            "pull_request_target" => Ok(Self::PullRequestTarget),
+            "repository_dispatch" => Ok(Self::RepositoryDispatch),
+            "release" => Ok(Self::Release),
+            "schedule" => Ok(Self::Schedule),
+            "merge_group" => Ok(Self::MergeGroup),
+            "create" => Ok(Self::Create),
+            "delete" => Ok(Self::Delete),
+            _ => Err(AppError::InvalidPolicy),
+        }
+    }
+}
+
+impl TryFrom<&str> for WorkflowEventName {
+    type Error = AppError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.to_owned().try_into()
+    }
+}
+
+impl fmt::Display for WorkflowEventName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -184,6 +258,15 @@ impl Policy {
         &self.allowed_ref
     }
 
+    /// Returns whether the workflow run event is allowed to request release approval.
+    pub fn allows_event(&self, event: &str) -> bool {
+        let Ok(event_name) = WorkflowEventName::try_from(event) else {
+            return false;
+        };
+
+        self.allowed_events.contains(&event_name)
+    }
+
     pub fn release_environment_name(&self) -> &EnvironmentName {
         &self.release_environment_name
     }
@@ -217,8 +300,18 @@ impl TryFrom<RawPolicy> for Policy {
 
     /// Converts an unvalidated raw policy into validated policy fields.
     fn try_from(raw: RawPolicy) -> Result<Self, Self::Error> {
+        let allowed_events = raw
+            .allowed_events
+            .into_iter()
+            .map(WorkflowEventName::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        if allowed_events.is_empty() {
+            return Err(AppError::InvalidPolicy);
+        }
+
         Ok(Self {
             allowed_ref: raw.allowed_ref.try_into()?,
+            allowed_events,
             release_environment_name: raw.release_environment_name.try_into()?,
             release_gate_job_name: raw.release_gate_job_name.try_into()?,
             release_workflow_path: raw.release_workflow_path.try_into()?,
@@ -337,6 +430,7 @@ mod tests {
     fn policy_deserializes_into_validated_types() {
         let policy: Policy = serde_json::from_value(json!({
             "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
             "release_gate_job_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
@@ -344,6 +438,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.allowed_ref().as_str(), "refs/heads/main");
+        assert!(policy.allows_event("workflow_dispatch"));
+        assert!(!policy.allows_event("push"));
         assert_eq!(policy.release_environment_name().as_str(), "release");
         assert_eq!(policy.release_gate_job_name().as_str(), "release-gate");
         assert_eq!(
@@ -356,6 +452,7 @@ mod tests {
     fn policy_from_str_deserializes_into_validated_types() {
         let policy: Policy = r#"{
             "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
             "release_gate_job_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
@@ -364,13 +461,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.allowed_ref().as_str(), "refs/heads/main");
+        assert!(policy.allows_event("workflow_dispatch"));
+        assert!(!policy.allows_event("push"));
         assert_eq!(policy.release_environment_name().as_str(), "release");
+    }
+
+    #[test]
+    fn policy_rejects_empty_allowed_events() {
+        let result: Result<Policy, _> = serde_json::from_value(json!({
+            "allowed_ref": "refs/heads/main",
+            "allowed_events": [],
+            "release_environment_name": "release",
+            "release_gate_job_name": "release-gate",
+            "release_workflow_path": ".github/workflows/release.yml"
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]
     fn policy_rejects_empty_strings() {
         let result: Result<Policy, _> = serde_json::from_value(json!({
             "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "",
             "release_gate_job_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"

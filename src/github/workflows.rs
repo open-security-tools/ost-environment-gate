@@ -19,6 +19,7 @@ pub struct WorkflowRunRepositorySummary {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowRunSummary {
     pub path: Option<String>,
+    pub event: Option<String>,
     pub head_repository: Option<WorkflowRunRepositorySummary>,
 }
 

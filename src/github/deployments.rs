@@ -346,6 +346,7 @@ mod tests {
     fn test_policy() -> Policy {
         serde_json::from_value(json!({
             "allowed_ref": "refs/heads/main",
+            "allowed_events": ["workflow_dispatch"],
             "release_environment_name": "release",
             "release_gate_job_name": "release-gate",
             "release_workflow_path": ".github/workflows/release.yml"
