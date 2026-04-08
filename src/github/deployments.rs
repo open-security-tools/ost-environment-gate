@@ -4,8 +4,8 @@ use crate::{
     config::{EnvironmentName, GitRef},
     error::AppError,
     github::{
-        github_request, send_github_request, GithubApiBase, InstallationId, Repository,
-        RepositoryId, RunId,
+        github_api_url, github_request, send_github_request, GithubApiBase, InstallationId,
+        Repository, RepositoryId, RunId,
     },
 };
 
@@ -90,9 +90,8 @@ impl DeploymentCallbackUrl {
         &self.0
     }
 
-    /// Parses and validates a deployment callback URL, ensuring its origin
-    /// (scheme + host + port) matches the configured GitHub API base URL.
-    pub fn parse(value: String, expected_base: &GithubApiBase) -> Result<Self, AppError> {
+    /// Parses a deployment callback URL from the webhook payload.
+    pub fn parse(value: String) -> Result<Self, AppError> {
         let value = value.trim().to_string();
         if value.is_empty() {
             return Err(AppError::DeploymentProtectionPayloadInvalid);
@@ -100,20 +99,32 @@ impl DeploymentCallbackUrl {
         let url = reqwest::Url::parse(&value)
             .map_err(|_| AppError::DeploymentProtectionPayloadInvalid)?;
 
-        let expected = expected_base.as_url();
-        if url.scheme() != expected.scheme()
-            || url.host_str() != expected.host_str()
-            || url.port() != expected.port()
-        {
-            tracing::warn!(
-                callback_origin = %url.origin().ascii_serialization(),
-                expected_origin = %expected.origin().ascii_serialization(),
-                "deployment callback URL origin does not match configured GitHub API base"
-            );
-            return Err(AppError::DeploymentProtectionPayloadInvalid);
-        }
+        Ok(Self(url))
+    }
+
+    /// Builds the exact deployment callback URL expected for the validated
+    /// repository and workflow run.
+    pub fn expected_for_run(
+        github_api_base: &GithubApiBase,
+        repository: &Repository,
+        run_id: RunId,
+    ) -> Result<Self, AppError> {
+        let url = github_api_url(
+            github_api_base,
+            &format!(
+                "repos/{}/{}/actions/runs/{run_id}/deployment_protection_rule",
+                repository.owner().as_str(),
+                repository.name().as_str(),
+            ),
+        )?;
 
         Ok(Self(url))
+    }
+
+    /// Returns whether this callback URL exactly matches the expected GitHub
+    /// deployment protection review endpoint.
+    pub fn matches_expected(&self, expected: &Self) -> bool {
+        self.0 == expected.0
     }
 }
 
@@ -138,7 +149,7 @@ impl RequestedDeploymentProtection {
             .deployment_callback_url
             .clone()
             .ok_or(AppError::DeploymentProtectionPayloadInvalid)
-            .and_then(|url| DeploymentCallbackUrl::parse(url, github_api_base))?;
+            .and_then(DeploymentCallbackUrl::parse)?;
 
         let environment = payload
             .environment
@@ -172,6 +183,17 @@ impl RequestedDeploymentProtection {
             .and_then(|workflow_run| workflow_run.id)
             .and_then(RunId::new)
             .ok_or(AppError::DeploymentProtectionRunIdInvalid)?;
+
+        let expected_deployment_callback_url =
+            DeploymentCallbackUrl::expected_for_run(github_api_base, &repository, run_id)?;
+        if !deployment_callback_url.matches_expected(&expected_deployment_callback_url) {
+            tracing::warn!(
+                callback_url = %deployment_callback_url.as_url(),
+                expected_callback_url = %expected_deployment_callback_url.as_url(),
+                "deployment callback URL does not match expected workflow run review endpoint"
+            );
+            return Err(AppError::DeploymentProtectionPayloadInvalid);
+        }
 
         Ok(Self {
             environment,
@@ -390,9 +412,8 @@ mod tests {
 
     #[test]
     fn deployment_callback_url_rejects_invalid_url() {
-        let base = test_github_api_base();
-        assert!(DeploymentCallbackUrl::parse("not a url".to_string(), &base).is_err());
-        assert!(DeploymentCallbackUrl::parse(String::new(), &base).is_err());
+        assert!(DeploymentCallbackUrl::parse("not a url".to_string()).is_err());
+        assert!(DeploymentCallbackUrl::parse(String::new()).is_err());
     }
 
     #[test]
@@ -498,59 +519,87 @@ mod tests {
     }
 
     #[test]
-    fn callback_url_parse_accepts_matching_origin() {
+    fn callback_url_matches_expected_exact_review_endpoint() {
         let base = GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
-        let url = DeploymentCallbackUrl::parse(
+        let repository = crate::github::Repository::try_from(String::from("octo/tools")).unwrap();
+        let expected = DeploymentCallbackUrl::expected_for_run(
+            &base,
+            &repository,
+            crate::github::RunId::new(1).unwrap(),
+        )
+        .unwrap();
+        let provided = DeploymentCallbackUrl::parse(
             "https://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
                 .to_string(),
-            &base,
-        );
-        assert!(url.is_ok());
+        )
+        .unwrap();
+
+        assert!(provided.matches_expected(&expected));
     }
 
     #[test]
-    fn callback_url_parse_rejects_different_host() {
-        let base = GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
-        let url = DeploymentCallbackUrl::parse(
-            "https://evil.example.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
-                .to_string(),
-            &base,
-        );
-        assert!(url.is_err());
+    fn callback_url_rejects_different_repo_in_requested_deployment_protection() {
+        let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
+            "action": "requested",
+            "environment": "release",
+            "installation": { "id": 1 },
+            "repository": { "id": 1, "full_name": "octo/tools" },
+            "deployment_callback_url": "https://api.github.com/repos/evil/tools/actions/runs/1/deployment_protection_rule",
+            "workflow_run": { "id": 1 }
+        }))
+        .unwrap();
+
+        assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
     }
 
     #[test]
-    fn callback_url_parse_rejects_http_when_https_expected() {
-        let base = GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
-        let url = DeploymentCallbackUrl::parse(
-            "http://api.github.com/repos/octo/tools/actions/runs/1/deployment_protection_rule"
-                .to_string(),
-            &base,
-        );
-        assert!(url.is_err());
+    fn callback_url_rejects_different_run_id_in_requested_deployment_protection() {
+        let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
+            "action": "requested",
+            "environment": "release",
+            "installation": { "id": 1 },
+            "repository": { "id": 1, "full_name": "octo/tools" },
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/2/deployment_protection_rule",
+            "workflow_run": { "id": 1 }
+        }))
+        .unwrap();
+
+        assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
     }
 
     #[test]
-    fn callback_url_parse_rejects_different_port() {
-        let base = GithubApiBase::try_from(String::from("http://localhost:8080")).unwrap();
-        let url = DeploymentCallbackUrl::parse(
-            "http://localhost:9999/repos/octo/tools/actions/runs/1/deployment_protection_rule"
-                .to_string(),
-            &base,
-        );
-        assert!(url.is_err());
+    fn callback_url_rejects_non_review_endpoint_path() {
+        let payload: DeploymentProtectionRulePayload = serde_json::from_value(json!({
+            "action": "requested",
+            "environment": "release",
+            "installation": { "id": 1 },
+            "repository": { "id": 1, "full_name": "octo/tools" },
+            "deployment_callback_url": "https://api.github.com/repos/octo/tools/actions/runs/1",
+            "workflow_run": { "id": 1 }
+        }))
+        .unwrap();
+
+        assert!(RequestedDeploymentProtection::parse(payload, &test_github_api_base()).is_err());
     }
 
     #[test]
-    fn callback_url_parse_accepts_matching_ghe_origin() {
+    fn callback_url_matches_expected_ghe_review_endpoint() {
         let base =
             GithubApiBase::try_from(String::from("https://ghe.corp.example.com/api/v3")).unwrap();
-        let url = DeploymentCallbackUrl::parse(
+        let repository = crate::github::Repository::try_from(String::from("octo/tools")).unwrap();
+        let expected = DeploymentCallbackUrl::expected_for_run(
+            &base,
+            &repository,
+            crate::github::RunId::new(1).unwrap(),
+        )
+        .unwrap();
+        let provided = DeploymentCallbackUrl::parse(
             "https://ghe.corp.example.com/api/v3/repos/octo/tools/actions/runs/1/deployment_protection_rule"
                 .to_string(),
-            &base,
-        );
-        assert!(url.is_ok());
+        )
+        .unwrap();
+
+        assert!(provided.matches_expected(&expected));
     }
 
     #[test]

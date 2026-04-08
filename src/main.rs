@@ -639,6 +639,31 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn webhook_returns_bad_request_for_mismatched_deployment_callback_url() {
+        let harness = Harness::new().await;
+        let mut payload = harness.requested_payload();
+        payload["deployment_callback_url"] = json!(format!(
+            "{}/repos/{OWNER}/{REPO}/actions/runs/{}/deployment_protection_rule",
+            harness.server.uri(),
+            RUN_ID + 1,
+        ));
+
+        let response = harness
+            .dispatch(harness.webhook_request("deployment_protection_rule", &payload))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(&response),
+            json!({
+                "code": "deployment_protection_payload_invalid",
+                "error": "deployment protection payload is invalid"
+            })
+        );
+        assert!(harness.received_paths().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn webhook_returns_unprocessable_entity_for_missing_workflow_run_id() {
         let harness = Harness::new().await;
         let payload = json!({
