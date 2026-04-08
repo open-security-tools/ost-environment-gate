@@ -64,8 +64,12 @@ impl fmt::Display for Conclusion {
 
 impl WorkflowJobUrlReference {
     /// Parses a GitHub Actions job URL like `/owner/repo/actions/runs/<run>/job/<job>`.
-    pub fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str, github_web_origin: &reqwest::Url) -> Option<Self> {
         let url = reqwest::Url::parse(value).ok()?;
+        if !matches_github_web_origin(&url, github_web_origin) {
+            return None;
+        }
+
         let segments = url.path_segments()?.collect::<Vec<_>>();
 
         segments.windows(7).find_map(|window| {
@@ -81,6 +85,12 @@ impl WorkflowJobUrlReference {
             })
         })
     }
+}
+
+fn matches_github_web_origin(url: &reqwest::Url, github_web_origin: &reqwest::Url) -> bool {
+    url.scheme() == github_web_origin.scheme()
+        && url.host_str() == github_web_origin.host_str()
+        && url.port_or_known_default() == github_web_origin.port_or_known_default()
 }
 
 /// Identifies a GitHub Actions job URL and the workflow/job ids it references.
@@ -204,8 +214,10 @@ mod tests {
 
     #[test]
     fn workflow_job_url_reference_parses_actions_job_urls() {
+        let github_web_origin = reqwest::Url::parse("https://github.com/").unwrap();
         let reference = WorkflowJobUrlReference::parse(
             "https://github.com/zaniebot/release-authenticator-example/actions/runs/23625057533/job/69582278191",
+            &github_web_origin,
         )
         .unwrap();
 
@@ -215,6 +227,18 @@ mod tests {
         );
         assert_eq!(*reference.run_id, 23625057533);
         assert_eq!(*reference.job_id, 69582278191);
+    }
+
+    #[test]
+    fn workflow_job_url_reference_rejects_wrong_origin() {
+        let github_web_origin = reqwest::Url::parse("https://github.com/").unwrap();
+
+        let reference = WorkflowJobUrlReference::parse(
+            "https://attacker.invalid/zaniebot/release-authenticator-example/actions/runs/23625057533/job/69582278191",
+            &github_web_origin,
+        );
+
+        assert_eq!(reference, None);
     }
 
     #[tokio::test]

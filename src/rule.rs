@@ -271,8 +271,9 @@ async fn validate_successful_gate_deployment_job(
     policy: &Policy,
     status: &DeploymentStatusSummary,
 ) -> Result<GateDeploymentValidation, AppError> {
+    let github_web_origin = github_api_base.web_origin()?;
     let log_reference = match status.log_url.as_deref() {
-        Some(url) => match WorkflowJobUrlReference::parse(url) {
+        Some(url) => match WorkflowJobUrlReference::parse(url, &github_web_origin) {
             Some(reference) => Some(reference),
             None => {
                 return Ok(GateDeploymentValidation::Rejected(format!(
@@ -284,7 +285,7 @@ async fn validate_successful_gate_deployment_job(
         None => None,
     };
     let target_reference = match status.target_url.as_deref() {
-        Some(url) => match WorkflowJobUrlReference::parse(url) {
+        Some(url) => match WorkflowJobUrlReference::parse(url, &github_web_origin) {
             Some(reference) => Some(reference),
             None => {
                 return Ok(GateDeploymentValidation::Rejected(format!(

@@ -397,6 +397,13 @@ mod integration_tests {
                 .await;
         }
 
+        fn actions_job_url(&self, owner: &str, repo: &str, run_id: u64, job_id: u64) -> String {
+            format!(
+                "{}/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}",
+                self.server.uri()
+            )
+        }
+
         async fn mock_gate_deployment_status(&self, state: &str) {
             Mock::given(method("GET"))
                 .and(path(deployment_statuses_path()))
@@ -404,12 +411,8 @@ mod integration_tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!([
                     {
                         "state": state,
-                        "log_url": format!(
-                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
-                        ),
-                        "target_url": format!(
-                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
-                        )
+                        "log_url": self.actions_job_url(OWNER, REPO, RUN_ID, GATE_JOB_ID),
+                        "target_url": self.actions_job_url(OWNER, REPO, RUN_ID, GATE_JOB_ID)
                     }
                 ])))
                 .mount(&self.server)
@@ -434,13 +437,8 @@ mod integration_tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!([
                     {
                         "state": state,
-                        "log_url": format!(
-                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
-                        ),
-                        "target_url": format!(
-                            "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{}",
-                            GATE_JOB_ID + 1
-                        )
+                        "log_url": self.actions_job_url(OWNER, REPO, RUN_ID, GATE_JOB_ID),
+                        "target_url": self.actions_job_url(OWNER, REPO, RUN_ID, GATE_JOB_ID + 1)
                     }
                 ])))
                 .mount(&self.server)
@@ -917,12 +915,8 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
                 {
                     "state": "success",
-                    "log_url": format!(
-                        "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
-                    ),
-                    "target_url": format!(
-                        "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
-                    )
+                    "log_url": harness.actions_job_url(OWNER, REPO, 1, GATE_JOB_ID),
+                    "target_url": harness.actions_job_url(OWNER, REPO, 1, GATE_JOB_ID)
                 }
             ])))
             .mount(&harness.server)
@@ -934,12 +928,8 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
                 {
                     "state": "success",
-                    "log_url": format!(
-                        "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
-                    ),
-                    "target_url": format!(
-                        "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
-                    )
+                    "log_url": harness.actions_job_url(OWNER, REPO, RUN_ID, GATE_JOB_ID),
+                    "target_url": harness.actions_job_url(OWNER, REPO, RUN_ID, GATE_JOB_ID)
                 }
             ])))
             .mount(&harness.server)
@@ -1450,12 +1440,8 @@ mod integration_tests {
         harness
             .mock_gate_deployment_status_with_custom_urls(
                 "success",
-                Some(format!(
-                    "https://github.com/octo/tools/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
-                )),
-                Some(format!(
-                    "https://github.com/octo/tools/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
-                )),
+                Some(harness.actions_job_url("octo", "tools", RUN_ID, GATE_JOB_ID)),
+                Some(harness.actions_job_url("octo", "tools", RUN_ID, GATE_JOB_ID)),
             )
             .await;
         harness
@@ -1499,12 +1485,8 @@ mod integration_tests {
         harness
             .mock_gate_deployment_status_with_custom_urls(
                 "success",
-                Some(format!(
-                    "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
-                )),
-                Some(format!(
-                    "https://github.com/{OWNER}/{REPO}/actions/runs/1/job/{GATE_JOB_ID}"
-                )),
+                Some(harness.actions_job_url(OWNER, REPO, 1, GATE_JOB_ID)),
+                Some(harness.actions_job_url(OWNER, REPO, 1, GATE_JOB_ID)),
             )
             .await;
         harness
@@ -1551,6 +1533,53 @@ mod integration_tests {
             .mock_gate_deployment_status_with_custom_urls(
                 "success",
                 Some("not-a-valid-url".to_string()),
+                Some(harness.actions_job_url(OWNER, REPO, RUN_ID, GATE_JOB_ID)),
+            )
+            .await;
+        harness
+            .mock_review_response(
+                200,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "rejected",
+                    "comment": "release-gate deployment status is missing a valid actions job url"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+
+        let paths = harness.received_paths().await;
+        assert_eq!(paths.len(), 5, "unexpected github calls: {paths:?}");
+        assert_path_call_count(&paths, &installation_token_path(), 1);
+        assert_path_call_count(&paths, &workflow_run_path(), 1);
+        assert_path_call_count(&paths, &deployments_path(), 1);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 1);
+        assert_path_call_count(&paths, &workflow_job_path(), 0);
+        assert_path_call_count(&paths, &review_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_when_gate_deployment_status_uses_wrong_host() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness
+            .mock_gate_deployment_status_with_custom_urls(
+                "success",
+                Some(format!(
+                    "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
+                )),
                 Some(format!(
                     "https://github.com/{OWNER}/{REPO}/actions/runs/{RUN_ID}/job/{GATE_JOB_ID}"
                 )),
