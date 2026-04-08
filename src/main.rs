@@ -664,7 +664,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn webhook_returns_unprocessable_entity_for_missing_workflow_run_id() {
+    async fn webhook_returns_unprocessable_entity_for_invalid_run_id_in_callback_url() {
         let harness = Harness::new().await;
         let payload = json!({
             "action": "requested",
@@ -676,10 +676,9 @@ mod integration_tests {
                 "full_name": "zaniebot/release-authenticator-example"
             },
             "deployment_callback_url": format!(
-                "{}/repos/zaniebot/release-authenticator-example/actions/runs/1/deployment_protection_rule",
+                "{}/repos/zaniebot/release-authenticator-example/actions/runs/not-a-number/deployment_protection_rule",
                 harness.server.uri()
-            ),
-            "workflow_run": { "id": 0 }
+            )
         });
 
         let response = harness
