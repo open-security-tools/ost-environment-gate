@@ -83,24 +83,29 @@ The GitHub App requires the minimum permissions to perform this action.
 
 The webhook API is implemented in Rust and deployed as a Lambda via AWS SAM.
 
-The GitHub App ID and webhook secret are stored in AWS SSM Parameter Store. The private key is
-stored in AWS Secrets Manager.
+The GitHub App ID and webhook secret are stored in AWS SSM Parameter Store. The GitHub App's private
+key is stored in AWS Secrets Manager.
 
 The webhook lifecycle is roughly:
 
-1. Receive an event from GitHub
+1. Receive a `deployment_protection_rule` event from GitHub (other events are discarded)
 1. Validate the event is authentic using the webhook secret
-1. Discard non-`deployment_protection_rule` events
-1. Use the private key to mint a JWT
-1. Exchange the JWT for a GitHub access token (`POST /app/installations/{id}/access_tokens`)
+1. Use the private key to mint a JWT then exchange JWT for a GitHub access token
 1. Extract the workflow run id from the event
-1. Validate that the workflow run comes from the same repository, expected event, and expected workflow file (`GET /repos/{owner}/{repo}/actions/runs/{run_id}`)
-1. Look up deployments for the configured gate environment and the same commit SHA (`GET /repos/{owner}/{repo}/deployments`)
-1. Read the latest status for the matching gate deployment (`GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses`)
-1. Parse the deployment status `log_url` / `target_url` and resolve the referenced job (`GET /repos/{owner}/{repo}/actions/jobs/{job_id}`)
-1. Verify the referenced job belongs to the same repository, workflow run, and commit SHA, and that it completed successfully
-1. Approve or deny the deployment (`POST /repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule`)
-1. Return an HTTP 204
+1. Look up deployments for the configured environment and the same commit SHA
+1. Read the latest status for the matching deployment
+1. Extract the job run from the deployment status
+1. Approve or deny the deployment according to the policy
+1. Return an HTTP 204 indicating successful event receipt
+
+Requests to the following GitHub routes are expected:
+
+- `POST /app/installations/{id}/access_tokens`
+- `GET /repos/{owner}/{repo}/actions/runs/{run_id}`
+- `GET /repos/{owner}/{repo}/deployments`
+- `GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses`
+- `GET /repos/{owner}/{repo}/actions/jobs/{job_id}`
+- `POST /repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule`
 
 ## Policy
 
@@ -110,15 +115,14 @@ The deployment protection rule approves `release` only when all of these checks 
 1. The requested Git ref matches `allowed_ref`
 1. The workflow run event is included in `allowed_events`
 1. The workflow run path matches `release_workflow_path`
-1. The callback URL is exactly the expected deployment-protection review endpoint for the same repository and workflow run
-1. The workflow run head repository matches the requesting repository (fork runs are rejected)
-1. There is a successful deployment to `release_gate_environment_name` for the same commit SHA
-1. The successful gate deployment status points at a valid GitHub Actions job URL
-1. The referenced job belongs to the same repository, workflow run, and commit SHA
+1. The workflow run head repository matches the requesting repository (forks are rejected)
+1. There is a successful deployment to `release_gate_environment_name` for the commit
+1. The deployment status includes a valid GitHub Actions job URL
+1. The referenced job belongs to the same repository, workflow run, and commit
 1. The referenced job completed successfully
 1. If `release_gate_job_name` is configured, the referenced job name matches it
 
-Example policy:
+An example policy is as follows:
 
 ```json
 {
@@ -130,6 +134,3 @@ Example policy:
   "release_workflow_path": ".github/workflows/release.yml"
 }
 ```
-
-`release_gate_job_name` is optional. When omitted, any successful gate job for the expected run and
-commit SHA is accepted.
