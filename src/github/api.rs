@@ -29,6 +29,27 @@ impl GithubApiBase {
     pub fn as_url(&self) -> &reqwest::Url {
         &self.0
     }
+
+    /// Returns the matching GitHub web origin for Actions URLs.
+    pub fn web_origin(&self) -> Result<reqwest::Url, AppError> {
+        let mut url = self.0.clone();
+
+        if url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
+        {
+            url.set_host(Some("github.com"))
+                .map_err(|_| AppError::InvalidGithubApiUrl)?;
+            url.set_port(None)
+                .map_err(|_| AppError::InvalidGithubApiUrl)?;
+        }
+
+        url.set_path("/");
+        url.set_query(None);
+        url.set_fragment(None);
+
+        Ok(url)
+    }
 }
 
 impl AsRef<reqwest::Url> for GithubApiBase {
@@ -237,6 +258,24 @@ mod tests {
         let url = github_api_url(&base, "repos/octo/tools").unwrap();
 
         assert_eq!(url.as_str(), "https://api.github.com/repos/octo/tools");
+    }
+
+    #[test]
+    fn github_api_base_maps_public_api_origin_to_public_web_origin() {
+        let base = GithubApiBase::try_from(String::from("https://api.github.com")).unwrap();
+
+        let web_origin = base.web_origin().unwrap();
+
+        assert_eq!(web_origin.as_str(), "https://github.com/");
+    }
+
+    #[test]
+    fn github_api_base_strips_ghe_api_path_for_web_origin() {
+        let base = GithubApiBase::try_from(String::from("https://ghe.example.com/api/v3")).unwrap();
+
+        let web_origin = base.web_origin().unwrap();
+
+        assert_eq!(web_origin.as_str(), "https://ghe.example.com/");
     }
 
     #[test]
