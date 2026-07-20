@@ -7,7 +7,7 @@
        ▼                                 ▼
 ┌────────────────────┐         ┌─────────────────────────┐
 │ Webhook Lambda     │────────▶│ Deployment-review FIFO  │
-│ src/main.rs        │         │ serialized reviews      │
+│ src/main.rs        │         │ + FIFO dead-letter queue│
 │--------------------│         └────────────┬────────────┘
 │ verify signature   │                      │
 │ validate payload   │                      │ group: repository/run/environment
