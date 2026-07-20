@@ -12,7 +12,6 @@
 #   APP_ID_PARAMETER            SSM parameter name for App ID
 #   APP_PRIVATE_KEY_SECRET_NAME Secrets Manager secret name
 #   WEBHOOK_SECRET_PARAMETER    SSM parameter name for webhook secret
-#   ALARM_TOPIC_ARN             SNS topic ARN for environment-gate alarms
 #
 set -euo pipefail
 
@@ -52,7 +51,6 @@ require_var POLICY_FILE
 require_var APP_ID_PARAMETER
 require_var APP_PRIVATE_KEY_SECRET_NAME
 require_var WEBHOOK_SECRET_PARAMETER
-require_var ALARM_TOPIC_ARN
 
 if [[ ! -f "$POLICY_FILE" ]]; then
   echo "policy file not found: $POLICY_FILE" >&2
@@ -78,5 +76,4 @@ sam deploy \
     "ParameterKey=AppPrivateKeySecretName,ParameterValue=$APP_PRIVATE_KEY_SECRET_NAME" \
     "ParameterKey=AppIdParameterName,ParameterValue=$APP_ID_PARAMETER" \
     "ParameterKey=WebhookSecretParameterName,ParameterValue=$WEBHOOK_SECRET_PARAMETER" \
-    "ParameterKey=AlarmTopicArn,ParameterValue=$ALARM_TOPIC_ARN" \
   "$@"
