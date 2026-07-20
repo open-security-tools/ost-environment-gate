@@ -63,8 +63,8 @@
  │ env name         │   │ webhook_secret       │                          └────────────────────┘
  │ gate env         │   │ github_api_base      │
  │ gate job         │   │ http_client          │
- │ workflow path    │   └──────────────────────┘
- └──────────────────┘
+ │ workflow path    │   │ deployment_review_lock│
+ └──────────────────┘   └──────────────────────┘
 
                                      GitHub API layer
                                            │
@@ -93,6 +93,14 @@
               │---------------------------------│
               │ state: Approved | Rejected      │
               │ comment: String                 │
+              └─────────────────┬───────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────┐
+              │ DeploymentReviewLock            │
+              │ lock.rs / DynamoDB              │
+              │---------------------------------│
+              │ repository + run + environment  │
               └─────────────────┬───────────────┘
                                 │
                                 ▼

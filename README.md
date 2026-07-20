@@ -96,6 +96,9 @@ The webhook lifecycle is roughly:
 1. Read the latest status for the matching deployment
 1. Extract the job run from the deployment status
 1. Approve or deny the deployment according to the policy
+1. Acquire the per-repository, workflow-run, and environment review lock
+1. Submit the deployment protection review, retrying an ambiguous concurrent-review response once
+1. Release the review lock
 1. Return an HTTP 204 indicating successful event receipt
 
 Requests to the following GitHub routes are expected:
@@ -106,6 +109,18 @@ Requests to the following GitHub routes are expected:
 - `GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses`
 - `GET /repos/{owner}/{repo}/actions/jobs/{job_id}`
 - `POST /repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule`
+
+Large matrix workflows can request the same protected environment concurrently. The service uses a
+short-lived DynamoDB lock to serialize only the final review call for a repository, workflow run,
+and environment; policy evaluation and unrelated runs remain concurrent. Lock records expire after
+90 seconds so an interrupted invocation cannot permanently block a release. If GitHub returns its
+ambiguous `There was a problem approving one of the gates` response, the service retries the review
+once while the lock is held. Known already-reviewed and no-pending-deployment responses remain
+idempotent successes.
+
+Structured webhook logs include `X-GitHub-Delivery` as `delivery_id` and attach the repository,
+workflow run id, environment, decision, and GitHub review status/body to review failures, allowing
+failed deliveries to be correlated and redelivered.
 
 ## Policy
 

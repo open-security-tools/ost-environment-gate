@@ -32,6 +32,22 @@ Resources:
   Api:
     Type: AWS::Serverless::HttpApi
 
+  DeploymentReviewLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: lock_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: lock_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
   EnvironmentGateFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -45,6 +61,8 @@ Resources:
           APP_ID_PARAMETER: !Ref AppIdParameterName
           APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
           WEBHOOK_SECRET_PARAMETER: !Ref WebhookSecretParameterName
+          DEPLOYMENT_REVIEW_LOCK_TABLE: !Ref DeploymentReviewLockTable
+          RUST_LOG: info
       Events:
         Health:
           Type: HttpApi
@@ -70,6 +88,11 @@ Resources:
               Action:
                 - secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}*
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt DeploymentReviewLockTable.Arn
 
 Outputs:
   ApiUrl:

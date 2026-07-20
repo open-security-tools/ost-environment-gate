@@ -1,12 +1,13 @@
 use std::{env, fmt, time::Duration};
 
 use aws_config::BehaviorVersion;
+use aws_sdk_dynamodb::Client as DynamoDbClient;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use lambda_http::Error;
 use serde::Deserialize;
 
-use crate::{error::AppError, github::GithubApiBase};
+use crate::{error::AppError, github::GithubApiBase, lock::DeploymentReviewLock};
 
 const WORKFLOWS_PREFIX: &str = ".github/workflows/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -382,6 +383,7 @@ pub struct Config {
     pub webhook_secret: WebhookSecret,
     pub github_api_base: GithubApiBase,
     pub http_client: reqwest::Client,
+    pub deployment_review_lock: DeploymentReviewLock,
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -419,6 +421,8 @@ impl Config {
         };
         let github_api_base = GithubApiBase::from_env()?;
         let http_client = build_http_client()?;
+        let deployment_review_lock =
+            DeploymentReviewLock::from_env(DynamoDbClient::new(&shared_config))?;
 
         Ok(Self {
             policy,
@@ -427,6 +431,7 @@ impl Config {
             webhook_secret,
             github_api_base,
             http_client,
+            deployment_review_lock,
         })
     }
 }

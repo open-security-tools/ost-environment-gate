@@ -41,6 +41,12 @@ pub enum AppError {
     WorkflowJobLookupFailed,
     #[error("github deployment lookup failed")]
     DeploymentLookupFailed,
+    #[error("deployment review lock is not configured")]
+    DeploymentReviewLockNotConfigured,
+    #[error("timed out waiting for deployment review lock")]
+    DeploymentReviewLockTimeout,
+    #[error("deployment review lock failed")]
+    DeploymentReviewLockFailed,
     #[error("github deployment protection review failed")]
     DeploymentProtectionReviewFailed,
 }
@@ -68,6 +74,9 @@ impl AppError {
             Self::WorkflowRunLookupFailed => "workflow_run_lookup_failed",
             Self::WorkflowJobLookupFailed => "workflow_job_lookup_failed",
             Self::DeploymentLookupFailed => "deployment_lookup_failed",
+            Self::DeploymentReviewLockNotConfigured => "deployment_review_lock_not_configured",
+            Self::DeploymentReviewLockTimeout => "deployment_review_lock_timeout",
+            Self::DeploymentReviewLockFailed => "deployment_review_lock_failed",
             Self::DeploymentProtectionReviewFailed => "deployment_protection_review_failed",
         }
     }
@@ -80,7 +89,8 @@ impl AppError {
             | Self::AppIdNotConfigured
             | Self::AppPrivateKeyNotConfigured
             | Self::WebhookSecretNotConfigured
-            | Self::InvalidGithubApiUrl => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::InvalidGithubApiUrl
+            | Self::DeploymentReviewLockNotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
             Self::MissingWebhookEvent => StatusCode::BAD_REQUEST,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidGithubWebhookSignature => StatusCode::UNAUTHORIZED,
@@ -91,10 +101,12 @@ impl AppError {
             }
             Self::InstallationNotFound => StatusCode::FORBIDDEN,
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::DeploymentReviewLockTimeout => StatusCode::SERVICE_UNAVAILABLE,
             Self::GithubAccessTokenRequestFailed
             | Self::WorkflowRunLookupFailed
             | Self::WorkflowJobLookupFailed
             | Self::DeploymentLookupFailed
+            | Self::DeploymentReviewLockFailed
             | Self::DeploymentProtectionReviewFailed => StatusCode::BAD_GATEWAY,
         }
     }

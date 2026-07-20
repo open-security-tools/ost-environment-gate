@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 
 use crate::{
     config::{EnvironmentName, GitRef},
@@ -13,6 +16,8 @@ const REQUESTED_ACTION: &str = "requested";
 const DEPLOYMENTS_PER_PAGE: usize = 100;
 const DEPLOYMENTS_PER_PAGE_QUERY: &str = "100";
 const MAX_ENVIRONMENT_DEPLOYMENT_PAGES: usize = 10;
+const AMBIGUOUS_REVIEW_MAX_ATTEMPTS: usize = 2;
+const AMBIGUOUS_REVIEW_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Mirrors the inbound `deployment_protection_rule` webhook payload shape from GitHub.
 ///
@@ -490,50 +495,75 @@ pub async fn review_deployment_protection_rule(
 ) -> Result<(), AppError> {
     let url = deployment_callback_url.as_url().clone();
 
-    // TODO: Revisit retries here. This endpoint is also non-idempotent, so retrying
-    // after an ambiguous transport failure can duplicate review side effects.
-    let response = send_github_request(
-        github_request(http_client.post(url), installation_token).json(payload),
-        "deployment protection review",
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(?error, "deployment protection review failed");
-        AppError::DeploymentProtectionReviewFailed
-    })?;
+    for attempt in 1..=AMBIGUOUS_REVIEW_MAX_ATTEMPTS {
+        let response = send_github_request(
+            github_request(http_client.post(url.clone()), installation_token).json(payload),
+            "deployment protection review",
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(?error, attempt, "deployment protection review failed");
+            AppError::DeploymentProtectionReviewFailed
+        })?;
 
-    if response.status().is_success() {
-        return Ok(());
-    }
-
-    let status = response.status();
-    let response_body = response.text().await.map_err(|error| {
-        tracing::error!(
-            ?error,
-            status = %status,
-            "failed to read deployment protection review error response body"
-        );
-        AppError::DeploymentProtectionReviewFailed
-    })?;
-
-    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-        if let Some(reason) = idempotent_review_422_reason(&response_body) {
-            tracing::warn!(
-                status = %status,
-                reason = %reason,
-                response_body = %response_body,
-                "deployment protection review already processed; treating status as success"
-            );
+        if response.status().is_success() {
             return Ok(());
         }
+
+        let status = response.status();
+        let response_body = response.text().await.map_err(|error| {
+            tracing::error!(
+                ?error,
+                attempt,
+                status = %status,
+                "failed to read deployment protection review error response body"
+            );
+            AppError::DeploymentProtectionReviewFailed
+        })?;
+
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            match review_422_reason(&response_body) {
+                Some(
+                    reason @ (Review422Reason::NoPendingDeploymentRequests
+                    | Review422Reason::AlreadyReviewed),
+                ) => {
+                    tracing::warn!(
+                        attempt,
+                        status = %status,
+                        reason = %reason,
+                        response_body = %response_body,
+                        "deployment protection review already processed; treating status as success"
+                    );
+                    return Ok(());
+                }
+                Some(reason @ Review422Reason::AmbiguousConcurrentReview)
+                    if attempt < AMBIGUOUS_REVIEW_MAX_ATTEMPTS =>
+                {
+                    tracing::warn!(
+                        attempt,
+                        status = %status,
+                        reason = %reason,
+                        retry_delay_ms = AMBIGUOUS_REVIEW_RETRY_DELAY.as_millis(),
+                        response_body = %response_body,
+                        "deployment protection review returned ambiguous status; retrying"
+                    );
+                    sleep(AMBIGUOUS_REVIEW_RETRY_DELAY).await;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        tracing::error!(
+            attempt,
+            status = %status,
+            response_body = %response_body,
+            "unexpected deployment protection review status"
+        );
+        return Err(AppError::DeploymentProtectionReviewFailed);
     }
 
-    tracing::error!(
-        status = %status,
-        response_body = %response_body,
-        "unexpected deployment protection review status"
-    );
-    Err(AppError::DeploymentProtectionReviewFailed)
+    unreachable!("deployment protection review loop always returns or retries")
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,21 +578,23 @@ struct GithubApiErrorDetail {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdempotentReview422Reason {
+enum Review422Reason {
     NoPendingDeploymentRequests,
     AlreadyReviewed,
+    AmbiguousConcurrentReview,
 }
 
-impl std::fmt::Display for IdempotentReview422Reason {
+impl std::fmt::Display for Review422Reason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::NoPendingDeploymentRequests => "no_pending_deployment_requests",
             Self::AlreadyReviewed => "already_reviewed",
+            Self::AmbiguousConcurrentReview => "ambiguous_concurrent_review",
         })
     }
 }
 
-impl std::str::FromStr for IdempotentReview422Reason {
+impl std::str::FromStr for Review422Reason {
     type Err = ();
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -571,6 +603,7 @@ impl std::str::FromStr for IdempotentReview422Reason {
                 Ok(Self::NoPendingDeploymentRequests)
             }
             "deployment protection rule has already been reviewed" => Ok(Self::AlreadyReviewed),
+            "there was a problem approving one of the gates" => Ok(Self::AmbiguousConcurrentReview),
             _ => Err(()),
         }
     }
@@ -584,7 +617,7 @@ fn normalize_github_error_message(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn idempotent_review_422_reason(body: &str) -> Option<IdempotentReview422Reason> {
+fn review_422_reason(body: &str) -> Option<Review422Reason> {
     let body = body.trim();
     if body.is_empty() {
         return None;
@@ -603,15 +636,15 @@ fn idempotent_review_422_reason(body: &str) -> Option<IdempotentReview422Reason>
                 .flatten()
                 .filter_map(|error| error.message.as_deref()),
         )
-        .find_map(|message| message.parse::<IdempotentReview422Reason>().ok())
+        .find_map(|message| message.parse::<Review422Reason>().ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_environment_deployments, fetch_latest_deployment_status,
-        idempotent_review_422_reason, CommitSha, DeploymentCallbackUrl, DeploymentId,
-        DeploymentProtectionRulePayload, DeploymentState, RefName, RequestedDeploymentProtection,
+        fetch_environment_deployments, fetch_latest_deployment_status, review_422_reason,
+        CommitSha, DeploymentCallbackUrl, DeploymentId, DeploymentProtectionRulePayload,
+        DeploymentState, RefName, RequestedDeploymentProtection,
     };
     use crate::config::{EnvironmentName, GitRef, Policy};
     use crate::error::AppError;
@@ -960,7 +993,7 @@ mod tests {
         })
         .to_string();
 
-        assert!(idempotent_review_422_reason(&body).is_some());
+        assert!(review_422_reason(&body).is_some());
     }
 
     #[test]
@@ -970,7 +1003,7 @@ mod tests {
         })
         .to_string();
 
-        assert!(idempotent_review_422_reason(&body).is_some());
+        assert!(review_422_reason(&body).is_some());
     }
 
     #[test]
@@ -985,12 +1018,12 @@ mod tests {
         })
         .to_string();
 
-        assert!(idempotent_review_422_reason(&body).is_none());
+        assert!(review_422_reason(&body).is_none());
     }
 
     #[test]
     fn idempotent_422_detector_rejects_non_json_body() {
-        assert!(idempotent_review_422_reason("unprocessable").is_none());
+        assert!(review_422_reason("unprocessable").is_none());
     }
 
     #[test]
@@ -1000,7 +1033,22 @@ mod tests {
         })
         .to_string();
 
-        assert!(idempotent_review_422_reason(&body).is_some());
+        assert!(review_422_reason(&body).is_some());
+    }
+
+    #[test]
+    fn review_422_detector_accepts_ambiguous_concurrent_review_error() {
+        let body = json!({
+            "message": "Validation Failed",
+            "errors": [
+                {
+                    "message": "There was a problem approving one of the gates"
+                }
+            ]
+        })
+        .to_string();
+
+        assert!(review_422_reason(&body).is_some());
     }
 
     #[tokio::test]

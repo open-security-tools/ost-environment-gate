@@ -1,5 +1,6 @@
 use lambda_http::http::{Method, StatusCode};
 use lambda_http::{run, service_fn, Body, Error, Request, Response};
+use tracing::Instrument;
 
 use crate::error::AppError;
 use crate::response::AppResponse;
@@ -62,6 +63,7 @@ pub(crate) use impl_string_newtype;
 mod config;
 mod error;
 mod github;
+mod lock;
 mod response;
 mod rule;
 
@@ -110,54 +112,79 @@ async fn handle_github_webhook(
     config: config::Config,
     request: Request,
 ) -> Result<AppResponse, AppError> {
-    let signature = github::WebhookSignature::try_from(&request)?;
-    let event = github::WebhookEvent::try_from(&request)?;
-    let body_bytes = request_body_bytes(&request);
+    let delivery_id = request
+        .headers()
+        .get("x-github-delivery")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_string();
+    let span = tracing::info_span!("github_webhook", delivery_id = %delivery_id);
 
-    signature.verify(&config.webhook_secret, body_bytes)?;
+    let result: Result<AppResponse, AppError> = async move {
+        let signature = github::WebhookSignature::try_from(&request)?;
+        let event = github::WebhookEvent::try_from(&request)?;
+        let body_bytes = request_body_bytes(&request);
 
-    match event {
-        github::WebhookEvent::Ping => {
-            tracing::info!(webhook_event = "ping", outcome = "acknowledged");
-            Ok(AppResponse::status(StatusCode::NO_CONTENT))
-        }
-        github::WebhookEvent::Other(event) => {
-            tracing::info!(webhook_event = %event, outcome = "ignored");
-            Ok(AppResponse::status(StatusCode::NO_CONTENT))
-        }
-        github::WebhookEvent::DeploymentProtectionRule => {
-            let outcome =
-                rule::handle_deployment_protection_rule_webhook(config, body_bytes).await?;
+        signature.verify(&config.webhook_secret, body_bytes)?;
 
-            match outcome {
-                DeploymentProtectionRuleOutcome::Ignored { action } => {
-                    tracing::info!(
-                        webhook_event = "deployment_protection_rule",
-                        outcome = "ignored",
-                        action = %action
-                    );
-                    Ok(AppResponse::status(StatusCode::NO_CONTENT))
-                }
-                DeploymentProtectionRuleOutcome::Reviewed {
-                    repository,
-                    run_id,
-                    environment,
-                    decision,
-                } => {
-                    tracing::info!(
-                        webhook_event = "deployment_protection_rule",
-                        outcome = "reviewed",
-                        repository = %repository,
-                        run_id = *run_id,
-                        environment = %environment,
-                        state = %decision.state,
-                        comment = %decision.comment
-                    );
-                    Ok(AppResponse::status(StatusCode::NO_CONTENT))
+        match event {
+            github::WebhookEvent::Ping => {
+                tracing::info!(webhook_event = "ping", outcome = "acknowledged");
+                Ok(AppResponse::status(StatusCode::NO_CONTENT))
+            }
+            github::WebhookEvent::Other(event) => {
+                tracing::info!(webhook_event = %event, outcome = "ignored");
+                Ok(AppResponse::status(StatusCode::NO_CONTENT))
+            }
+            github::WebhookEvent::DeploymentProtectionRule => {
+                let outcome =
+                    rule::handle_deployment_protection_rule_webhook(config, body_bytes).await?;
+
+                match outcome {
+                    DeploymentProtectionRuleOutcome::Ignored { action } => {
+                        tracing::info!(
+                            webhook_event = "deployment_protection_rule",
+                            outcome = "ignored",
+                            action = %action
+                        );
+                        Ok(AppResponse::status(StatusCode::NO_CONTENT))
+                    }
+                    DeploymentProtectionRuleOutcome::Reviewed {
+                        repository,
+                        run_id,
+                        environment,
+                        decision,
+                    } => {
+                        tracing::info!(
+                            webhook_event = "deployment_protection_rule",
+                            outcome = "reviewed",
+                            repository = %repository,
+                            run_id = *run_id,
+                            environment = %environment,
+                            state = %decision.state,
+                            comment = %decision.comment
+                        );
+                        Ok(AppResponse::status(StatusCode::NO_CONTENT))
+                    }
                 }
             }
         }
     }
+    .instrument(span.clone())
+    .await;
+
+    if let Err(error) = &result {
+        span.in_scope(|| {
+            tracing::error!(
+                code = error.code(),
+                status = %error.status(),
+                error = %error,
+                "github webhook request failed"
+            );
+        });
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -208,6 +235,7 @@ mod integration_tests {
                 webhook_secret: WEBHOOK_SECRET.to_string().try_into().unwrap(),
                 github_api_base: server.uri().try_into().unwrap(),
                 http_client: config::build_http_client().unwrap(),
+                deployment_review_lock: crate::lock::DeploymentReviewLock::in_memory(),
             };
 
             Self { server, config }
@@ -240,6 +268,7 @@ mod integration_tests {
                 .method("POST")
                 .uri("/github/webhook")
                 .header("x-github-event", event)
+                .header("x-github-delivery", "00000000-0000-4000-8000-000000000001")
                 .header("x-hub-signature-256", signature)
                 .body(Body::Binary(body))
                 .unwrap()
@@ -1081,6 +1110,114 @@ mod integration_tests {
         assert_path_call_count(&paths, &deployment_statuses_path(), 1);
         assert_path_call_count(&paths, &workflow_job_path(), 1);
         assert_path_call_count(&paths, &review_path(), 2);
+    }
+
+    #[tokio::test]
+    async fn webhook_retries_ambiguous_422_review_submission_once() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(review_path()))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "There was a problem approving one of the gates"
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&harness.server)
+            .await;
+
+        harness
+            .mock_review_response(
+                204,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "approved",
+                    "comment": "release-gate deployment succeeded"
+                })),
+            )
+            .await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_no_content(&response);
+        assert_path_call_count(&harness.received_paths().await, &review_path(), 2);
+    }
+
+    #[tokio::test]
+    async fn webhook_serializes_concurrent_review_submissions_for_the_same_run() {
+        let harness = std::sync::Arc::new(Harness::new().await);
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(review_path()))
+            .respond_with(
+                ResponseTemplate::new(204).set_delay(std::time::Duration::from_millis(500)),
+            )
+            .expect(2)
+            .mount(&harness.server)
+            .await;
+
+        let first_harness = harness.clone();
+        let first = tokio::spawn(async move {
+            first_harness
+                .dispatch(first_harness.webhook_request(
+                    "deployment_protection_rule",
+                    &first_harness.requested_payload(),
+                ))
+                .await
+        });
+
+        for _ in 0..100 {
+            if harness
+                .received_paths()
+                .await
+                .iter()
+                .any(|path| path == &review_path())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let second_harness = harness.clone();
+        let second = tokio::spawn(async move {
+            second_harness
+                .dispatch(second_harness.webhook_request(
+                    "deployment_protection_rule",
+                    &second_harness.requested_payload(),
+                ))
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_path_call_count(&harness.received_paths().await, &review_path(), 1);
+
+        assert_no_content(&first.await.unwrap());
+        assert_no_content(&second.await.unwrap());
+        assert_path_call_count(&harness.received_paths().await, &review_path(), 2);
     }
 
     #[tokio::test]
@@ -1968,6 +2105,45 @@ mod integration_tests {
             .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
             .await;
         harness.mock_review_response(500, None).await;
+
+        let response = harness
+            .dispatch(
+                harness.webhook_request("deployment_protection_rule", &harness.requested_payload()),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response_json(&response),
+            json!({
+                "code": "deployment_protection_review_failed",
+                "error": "github deployment protection review failed"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_returns_bad_gateway_when_ambiguous_422_review_persists() {
+        let harness = Harness::new().await;
+
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(review_path()))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "There was a problem approving one of the gates"
+            })))
+            .expect(2)
+            .mount(&harness.server)
+            .await;
 
         let response = harness
             .dispatch(

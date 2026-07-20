@@ -8,6 +8,7 @@ use crate::{
         WorkflowJobUrlReference, WorkflowRunSummary,
     },
 };
+use tracing::Instrument;
 
 const REQUESTED_ACTION: &str = "requested";
 
@@ -164,19 +165,47 @@ pub async fn handle_deployment_protection_rule_webhook(
         }
     };
 
-    github::review_deployment_protection_rule(
-        &config.http_client,
-        &installation_token.token,
-        &requested.deployment_callback_url,
-        &DeploymentProtectionRuleReviewPayload {
-            environment_name: requested.environment.as_str(),
-            state: match decision.state {
-                ReleaseProtectionState::Approved => DeploymentProtectionRuleReviewState::Approved,
-                ReleaseProtectionState::Rejected => DeploymentProtectionRuleReviewState::Rejected,
+    let review_span = tracing::info_span!(
+        "deployment_protection_review",
+        repository = %requested.repository,
+        run_id = *requested.run_id,
+        environment = %requested.environment,
+        state = %decision.state,
+        comment = %decision.comment
+    );
+    async {
+        let lock = config
+            .deployment_review_lock
+            .acquire(
+                &requested.repository,
+                requested.run_id,
+                &requested.environment,
+            )
+            .await?;
+        let review_result = github::review_deployment_protection_rule(
+            &config.http_client,
+            &installation_token.token,
+            &requested.deployment_callback_url,
+            &DeploymentProtectionRuleReviewPayload {
+                environment_name: requested.environment.as_str(),
+                state: match decision.state {
+                    ReleaseProtectionState::Approved => {
+                        DeploymentProtectionRuleReviewState::Approved
+                    }
+                    ReleaseProtectionState::Rejected => {
+                        DeploymentProtectionRuleReviewState::Rejected
+                    }
+                },
+                comment: decision.comment.as_str(),
             },
-            comment: decision.comment.as_str(),
-        },
-    )
+        )
+        .await;
+        let release_result = lock.release().await;
+
+        review_result?;
+        release_result
+    }
+    .instrument(review_span)
     .await?;
 
     Ok(DeploymentProtectionRuleOutcome::Reviewed {
