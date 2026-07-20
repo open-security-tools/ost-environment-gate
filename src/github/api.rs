@@ -12,6 +12,8 @@ const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com/";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_REQUEST_MAX_ATTEMPTS: usize = 3;
 const GITHUB_REQUEST_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+const GITHUB_REQUEST_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const GITHUB_RATE_LIMIT_MIN_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// Stores the configured base URL for GitHub API requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +95,16 @@ pub async fn send_github_request(
             Ok(response) if is_retryable_response(response.status(), response.headers()) => {
                 if let Some(next_builder) = next_builder {
                     let retry_delay = retry_delay(response.status(), response.headers(), backoff);
+                    if retry_delay > GITHUB_REQUEST_MAX_RETRY_DELAY {
+                        tracing::warn!(
+                            operation,
+                            attempt,
+                            status = %response.status(),
+                            retry_delay_seconds = retry_delay.as_secs(),
+                            "github retry delay exceeds the in-invocation budget"
+                        );
+                        return Ok(response);
+                    }
                     tracing::warn!(
                         operation,
                         attempt,
@@ -169,7 +181,13 @@ fn normalize_github_api_base(mut url: reqwest::Url) -> reqwest::Url {
 
 fn retry_delay(status: StatusCode, headers: &HeaderMap, fallback: Duration) -> Duration {
     if is_retryable_response(status, headers) {
-        retry_after_delay(headers).unwrap_or(fallback)
+        retry_after_delay(headers).unwrap_or_else(|| {
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                GITHUB_RATE_LIMIT_MIN_RETRY_DELAY
+            } else {
+                fallback
+            }
+        })
     } else {
         fallback
     }
@@ -282,7 +300,7 @@ mod tests {
                 &HeaderMap::new(),
                 Duration::from_millis(200)
             ),
-            Duration::from_millis(200)
+            Duration::from_secs(60)
         );
         assert_eq!(
             retry_delay(
@@ -290,7 +308,7 @@ mod tests {
                 &invalid_headers,
                 Duration::from_millis(200)
             ),
-            Duration::from_millis(200)
+            Duration::from_secs(60)
         );
     }
 
@@ -307,7 +325,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = test_http_client();
 
-        for status in [429, 500, 502, 503, 504] {
+        for status in [500, 502, 503, 504] {
             server.reset().await;
 
             Mock::given(method("GET"))
@@ -366,6 +384,46 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn send_github_request_returns_long_rate_limits_without_blocking_the_worker() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rate-limit"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = send_github_request(
+            test_http_client().get(format!("{}/rate-limit", server.uri())),
+            "long rate limit test",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn send_github_request_defers_rate_limits_without_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rate-limit"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = send_github_request(
+            test_http_client().get(format!("{}/rate-limit", server.uri())),
+            "rate limit without retry-after test",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

@@ -4,7 +4,6 @@ use tracing::Instrument;
 
 use crate::error::AppError;
 use crate::response::AppResponse;
-use crate::rule::DeploymentProtectionRuleOutcome;
 
 macro_rules! impl_string_newtype {
     ($name:ident, $error_ty:ty, $error:expr $(, validate = $validate:expr)? ) => {
@@ -63,9 +62,10 @@ pub(crate) use impl_string_newtype;
 mod config;
 mod error;
 mod github;
-mod lock;
+mod queue;
 mod response;
 mod rule;
+mod worker;
 
 /// Starts the Lambda runtime for the environment gate service.
 #[tokio::main]
@@ -75,7 +75,18 @@ async fn main() -> Result<(), Error> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let config = config::Config::load().await?;
+    if std::env::var("HANDLER_MODE").as_deref() == Ok("worker") {
+        let config = config::Config::load().await?;
+        return lambda_runtime::run(lambda_runtime::service_fn(
+            move |event: lambda_runtime::LambdaEvent<worker::SqsEvent>| {
+                let config = config.clone();
+                async move { worker::handle_batch(config, event.payload).await }
+            },
+        ))
+        .await;
+    }
+
+    let config = config::WebhookConfig::load().await?;
 
     run(service_fn(move |request: Request| {
         let config = config.clone();
@@ -90,7 +101,10 @@ async fn main() -> Result<(), Error> {
 }
 
 /// Routes an incoming HTTP request to the appropriate handler.
-async fn handle_request(config: config::Config, request: Request) -> Result<AppResponse, AppError> {
+async fn handle_request(
+    config: config::WebhookConfig,
+    request: Request,
+) -> Result<AppResponse, AppError> {
     match (request.method().clone(), request.uri().path()) {
         (Method::GET, "/health") => Ok(AppResponse::health("ost-environment-gate")),
         (Method::POST, "/github/webhook") => handle_github_webhook(config, request).await,
@@ -109,7 +123,7 @@ fn request_body_bytes(request: &Request) -> &[u8] {
 
 /// Verifies and processes a GitHub webhook request.
 async fn handle_github_webhook(
-    config: config::Config,
+    config: config::WebhookConfig,
     request: Request,
 ) -> Result<AppResponse, AppError> {
     let delivery_id = request
@@ -137,36 +151,36 @@ async fn handle_github_webhook(
                 Ok(AppResponse::status(StatusCode::NO_CONTENT))
             }
             github::WebhookEvent::DeploymentProtectionRule => {
-                let outcome =
-                    rule::handle_deployment_protection_rule_webhook(config, body_bytes).await?;
-
-                match outcome {
-                    DeploymentProtectionRuleOutcome::Ignored { action } => {
-                        tracing::info!(
-                            webhook_event = "deployment_protection_rule",
-                            outcome = "ignored",
-                            action = %action
-                        );
-                        Ok(AppResponse::status(StatusCode::NO_CONTENT))
-                    }
-                    DeploymentProtectionRuleOutcome::Reviewed {
-                        repository,
-                        run_id,
-                        environment,
-                        decision,
-                    } => {
-                        tracing::info!(
-                            webhook_event = "deployment_protection_rule",
-                            outcome = "reviewed",
-                            repository = %repository,
-                            run_id = *run_id,
-                            environment = %environment,
-                            state = %decision.state,
-                            comment = %decision.comment
-                        );
-                        Ok(AppResponse::status(StatusCode::NO_CONTENT))
-                    }
+                let payload: github::DeploymentProtectionRulePayload =
+                    serde_json::from_slice(body_bytes)
+                        .map_err(|_| AppError::DeploymentProtectionPayloadInvalid)?;
+                let action = payload.action.as_deref().unwrap_or_default();
+                if action != "requested" {
+                    tracing::info!(
+                        webhook_event = "deployment_protection_rule",
+                        outcome = "ignored",
+                        action = %action
+                    );
+                    return Ok(AppResponse::status(StatusCode::NO_CONTENT));
                 }
+
+                let requested = github::RequestedDeploymentProtection::parse(
+                    payload.clone(),
+                    &config.github_api_base,
+                )?;
+                config
+                    .deployment_review_queue
+                    .enqueue(&delivery_id, payload, &requested)
+                    .await?;
+                tracing::info!(
+                    webhook_event = "deployment_protection_rule",
+                    outcome = "queued",
+                    repository = %requested.repository,
+                    run_id = *requested.run_id,
+                    environment = %requested.environment,
+                    deployment_id = ?requested.deployment_id
+                );
+                Ok(AppResponse::status(StatusCode::NO_CONTENT))
             }
         }
     }
@@ -219,6 +233,7 @@ mod integration_tests {
     struct Harness {
         server: MockServer,
         config: config::Config,
+        webhook_config: config::WebhookConfig,
     }
 
     impl Harness {
@@ -232,20 +247,73 @@ mod integration_tests {
                 policy,
                 app_id: "123".to_string().try_into().unwrap(),
                 app_private_key: test_app_private_key().to_string().try_into().unwrap(),
-                webhook_secret: WEBHOOK_SECRET.to_string().try_into().unwrap(),
                 github_api_base: server.uri().try_into().unwrap(),
                 http_client: config::build_http_client().unwrap(),
-                deployment_review_lock: crate::lock::DeploymentReviewLock::in_memory(),
             };
 
-            Self { server, config }
+            let webhook_config = config::WebhookConfig {
+                webhook_secret: WEBHOOK_SECRET.to_string().try_into().unwrap(),
+                github_api_base: server.uri().try_into().unwrap(),
+                deployment_review_queue: crate::queue::DeploymentReviewQueue::in_memory(),
+            };
+
+            Self {
+                server,
+                config,
+                webhook_config,
+            }
         }
 
         async fn dispatch(&self, request: Request) -> Response<Body> {
-            match handle_request(self.config.clone(), request).await {
+            let response = self.enqueue(request).await;
+            if !response.status().is_success() {
+                return response;
+            }
+
+            for message in self.webhook_config.deployment_review_queue.take_messages() {
+                let message: crate::queue::DeploymentReviewMessage =
+                    serde_json::from_str(&message.body).unwrap();
+                let body = serde_json::to_vec(&message.payload).unwrap();
+                if let Err(error) = crate::rule::handle_deployment_protection_rule_webhook(
+                    self.config.clone(),
+                    &body,
+                )
+                .await
+                {
+                    return error.into_response();
+                }
+            }
+
+            response
+        }
+
+        async fn enqueue(&self, request: Request) -> Response<Body> {
+            match handle_request(self.webhook_config.clone(), request).await {
                 Ok(response) => response.into_response(),
                 Err(error) => error.into_response(),
             }
+        }
+
+        async fn process_batch(&self, messages: &[crate::queue::QueuedDeploymentReview]) -> Value {
+            let event = serde_json::from_value(json!({
+                "Records": messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| json!({
+                        "messageId": format!("message-{index}"),
+                        "body": message.body,
+                        "attributes": { "MessageGroupId": message.group_id },
+                    }))
+                    .collect::<Vec<_>>()
+            }))
+            .unwrap();
+
+            serde_json::to_value(
+                crate::worker::handle_batch(self.config.clone(), event)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
         }
 
         fn requested_payload(&self) -> Value {
@@ -261,6 +329,19 @@ mod integration_tests {
         }
 
         fn webhook_request(&self, event: &str, payload: &Value) -> Request {
+            self.webhook_request_with_delivery(
+                event,
+                payload,
+                "00000000-0000-4000-8000-000000000001",
+            )
+        }
+
+        fn webhook_request_with_delivery(
+            &self,
+            event: &str,
+            payload: &Value,
+            delivery_id: &str,
+        ) -> Request {
             let body = serde_json::to_vec(payload).unwrap();
             let signature = sign_webhook(WEBHOOK_SECRET, &body);
 
@@ -268,7 +349,7 @@ mod integration_tests {
                 .method("POST")
                 .uri("/github/webhook")
                 .header("x-github-event", event)
-                .header("x-github-delivery", "00000000-0000-4000-8000-000000000001")
+                .header("x-github-delivery", delivery_id)
                 .header("x-hub-signature-256", signature)
                 .body(Body::Binary(body))
                 .unwrap()
@@ -543,6 +624,19 @@ mod integration_tests {
                 .await;
         }
 
+        async fn mock_pending_deployments(&self, pending: bool) {
+            let body = if pending {
+                json!([{ "environment": { "name": "release" } }])
+            } else {
+                json!([])
+            };
+            Mock::given(method("GET"))
+                .and(path(pending_deployments_path()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&self.server)
+                .await;
+        }
+
         async fn received_paths(&self) -> Vec<String> {
             self.server
                 .received_requests()
@@ -625,6 +719,10 @@ mod integration_tests {
 
     fn review_path() -> String {
         format!("/repos/{OWNER}/{REPO}/actions/runs/{RUN_ID}/deployment_protection_rule")
+    }
+
+    fn pending_deployments_path() -> String {
+        format!("/repos/{OWNER}/{REPO}/actions/runs/{RUN_ID}/pending_deployments")
     }
 
     fn response_json(response: &Response<Body>) -> Value {
@@ -1062,7 +1160,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn webhook_retries_review_submission_on_transient_failure() {
+    async fn webhook_does_not_retry_a_transient_review_submission_in_process() {
         let harness = Harness::new().await;
 
         harness.mock_installation_token(201).await;
@@ -1075,24 +1173,7 @@ mod integration_tests {
             .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
             .await;
 
-        Mock::given(method("POST"))
-            .and(path(review_path()))
-            .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&harness.server)
-            .await;
-
-        harness
-            .mock_review_response(
-                200,
-                Some(json!({
-                    "environment_name": "release",
-                    "state": "approved",
-                    "comment": "release-gate deployment succeeded"
-                })),
-            )
-            .await;
+        harness.mock_review_response(503, None).await;
 
         let response = harness
             .dispatch(
@@ -1100,20 +1181,20 @@ mod integration_tests {
             )
             .await;
 
-        assert_no_content(&response);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
         let paths = harness.received_paths().await;
-        assert_eq!(paths.len(), 7, "unexpected github calls: {paths:?}");
+        assert_eq!(paths.len(), 6, "unexpected github calls: {paths:?}");
         assert_path_call_count(&paths, &installation_token_path(), 1);
         assert_path_call_count(&paths, &workflow_run_path(), 1);
         assert_path_call_count(&paths, &deployments_path(), 1);
         assert_path_call_count(&paths, &deployment_statuses_path(), 1);
         assert_path_call_count(&paths, &workflow_job_path(), 1);
-        assert_path_call_count(&paths, &review_path(), 2);
+        assert_path_call_count(&paths, &review_path(), 1);
     }
 
     #[tokio::test]
-    async fn webhook_retries_ambiguous_422_review_submission_once() {
+    async fn webhook_does_not_retry_an_ambiguous_422_review_submission_in_process() {
         let harness = Harness::new().await;
 
         harness.mock_installation_token(201).await;
@@ -1131,20 +1212,8 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(422).set_body_json(json!({
                 "message": "There was a problem approving one of the gates"
             })))
-            .up_to_n_times(1)
             .expect(1)
             .mount(&harness.server)
-            .await;
-
-        harness
-            .mock_review_response(
-                204,
-                Some(json!({
-                    "environment_name": "release",
-                    "state": "approved",
-                    "comment": "release-gate deployment succeeded"
-                })),
-            )
             .await;
 
         let response = harness
@@ -1153,12 +1222,12 @@ mod integration_tests {
             )
             .await;
 
-        assert_no_content(&response);
-        assert_path_call_count(&harness.received_paths().await, &review_path(), 2);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_path_call_count(&harness.received_paths().await, &review_path(), 1);
     }
 
     #[tokio::test]
-    async fn webhook_serializes_concurrent_review_submissions_for_the_same_run() {
+    async fn webhook_queues_and_coalesces_a_29_job_release_burst() {
         let harness = std::sync::Arc::new(Harness::new().await);
 
         harness.mock_installation_token(201).await;
@@ -1171,53 +1240,737 @@ mod integration_tests {
             .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
             .await;
 
+        harness.mock_review_response(204, None).await;
+        harness.mock_pending_deployments(false).await;
+
+        let mut deliveries = tokio::task::JoinSet::new();
+        for index in 1..=29 {
+            let harness = harness.clone();
+            deliveries.spawn(async move {
+                let mut payload = harness.requested_payload();
+                payload["deployment"]["id"] = json!(5525311100_u64 + index);
+                harness
+                    .enqueue(harness.webhook_request_with_delivery(
+                        "deployment_protection_rule",
+                        &payload,
+                        &format!("00000000-0000-4000-8000-{index:012x}"),
+                    ))
+                    .await
+            });
+        }
+        while let Some(response) = deliveries.join_next().await {
+            assert_no_content(&response.unwrap());
+        }
+
+        assert!(harness.received_paths().await.is_empty());
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(messages.len(), 29);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.group_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.deduplication_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            29
+        );
+
+        for batch in messages.chunks(10) {
+            assert_eq!(
+                harness.process_batch(batch).await,
+                json!({ "batchItemFailures": [] })
+            );
+        }
+
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &installation_token_path(), 3);
+        assert_path_call_count(&paths, &workflow_run_path(), 3);
+        assert_path_call_count(&paths, &deployments_path(), 3);
+        assert_path_call_count(&paths, &deployment_statuses_path(), 3);
+        assert_path_call_count(&paths, &workflow_job_path(), 3);
+        assert_path_call_count(&paths, &review_path(), 3);
+        assert_path_call_count(&paths, &pending_deployments_path(), 3);
+    }
+
+    #[tokio::test]
+    async fn webhook_deduplicates_the_same_delivery_but_preserves_later_deployments() {
+        let harness = Harness::new().await;
+        let mut first = harness.requested_payload();
+        first["deployment"]["id"] = json!(5525311101_u64);
+        let mut second = harness.requested_payload();
+        second["deployment"]["id"] = json!(5525311102_u64);
+
+        for (payload, delivery_id) in [
+            (&first, "00000000-0000-4000-8000-000000000001"),
+            (&first, "00000000-0000-4000-8000-000000000001"),
+            (&second, "00000000-0000-4000-8000-000000000002"),
+        ] {
+            assert_no_content(
+                &harness
+                    .enqueue(harness.webhook_request_with_delivery(
+                        "deployment_protection_rule",
+                        payload,
+                        delivery_id,
+                    ))
+                    .await,
+            );
+        }
+
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].group_id, messages[1].group_id);
+        assert_ne!(messages[0].deduplication_id, messages[1].deduplication_id);
+        assert!(harness.received_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_invalid_delivery_ids_before_queueing() {
+        let harness = Harness::new().await;
+        for delivery_id in [
+            "not-a-uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "00000000-0000-4000-8000-00000000000A",
+        ] {
+            let response = harness
+                .enqueue(harness.webhook_request_with_delivery(
+                    "deployment_protection_rule",
+                    &harness.requested_payload(),
+                    delivery_id,
+                ))
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response_json(&response),
+                json!({
+                    "code": "invalid_github_delivery",
+                    "error": "missing or invalid github delivery id"
+                })
+            );
+        }
+
+        assert!(harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages()
+            .is_empty());
+        assert!(harness.received_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_coalesces_environment_names_case_insensitively() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        harness.mock_review_response(204, None).await;
+        harness.mock_pending_deployments(false).await;
+
+        for (environment, delivery_id, deployment_id) in [
+            (
+                "release",
+                "00000000-0000-4000-8000-000000000001",
+                5525311101_u64,
+            ),
+            (
+                "Release",
+                "00000000-0000-4000-8000-000000000002",
+                5525311102_u64,
+            ),
+        ] {
+            let mut payload = harness.requested_payload();
+            payload["environment"] = json!(environment);
+            payload["deployment"]["id"] = json!(deployment_id);
+            assert_no_content(
+                &harness
+                    .enqueue(harness.webhook_request_with_delivery(
+                        "deployment_protection_rule",
+                        &payload,
+                        delivery_id,
+                    ))
+                    .await,
+            );
+        }
+
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].group_id, messages[1].group_id);
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({ "batchItemFailures": [] })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 1);
+        assert_path_call_count(&paths, &pending_deployments_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_conflicting_review_context_within_a_fifo_group() {
+        let harness = Harness::new().await;
+        for (sha, delivery_id) in [
+            (SHA, "00000000-0000-4000-8000-000000000001"),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "00000000-0000-4000-8000-000000000002",
+            ),
+        ] {
+            let mut payload = harness.requested_payload();
+            payload["sha"] = json!(sha);
+            assert_no_content(
+                &harness
+                    .enqueue(harness.webhook_request_with_delivery(
+                        "deployment_protection_rule",
+                        &payload,
+                        delivery_id,
+                    ))
+                    .await,
+            );
+        }
+
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(messages[0].group_id, messages[1].group_id);
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({
+                "batchItemFailures": [
+                    { "itemIdentifier": "message-0" },
+                    { "itemIdentifier": "message-1" }
+                ]
+            })
+        );
+        assert!(harness.received_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_keeps_independent_fifo_groups_moving_after_a_review_failure() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        harness
+            .mock_review_response(
+                204,
+                Some(json!({
+                    "environment_name": "another-environment",
+                    "state": "rejected",
+                    "comment": "environment another-environment is not allowed"
+                })),
+            )
+            .await;
+        harness
+            .mock_review_response(
+                403,
+                Some(json!({
+                    "environment_name": "release",
+                    "state": "approved",
+                    "comment": "release-gate deployment succeeded"
+                })),
+            )
+            .await;
+        harness
+            .mock_review_response(
+                204,
+                Some(json!({
+                    "environment_name": "later-environment",
+                    "state": "rejected",
+                    "comment": "environment later-environment is not allowed"
+                })),
+            )
+            .await;
+        harness.mock_pending_deployments(false).await;
+
+        for (environment, delivery_id) in [
+            (
+                "another-environment",
+                "00000000-0000-4000-8000-000000000001",
+            ),
+            ("release", "00000000-0000-4000-8000-000000000002"),
+            ("later-environment", "00000000-0000-4000-8000-000000000003"),
+        ] {
+            let mut payload = harness.requested_payload();
+            payload["environment"] = json!(environment);
+            assert_no_content(
+                &harness
+                    .enqueue(harness.webhook_request_with_delivery(
+                        "deployment_protection_rule",
+                        &payload,
+                        delivery_id,
+                    ))
+                    .await,
+            );
+        }
+
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_ne!(messages[0].group_id, messages[1].group_id);
+        assert_ne!(messages[1].group_id, messages[2].group_id);
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({
+                "batchItemFailures": [
+                    { "itemIdentifier": "message-1" }
+                ]
+            })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 3);
+        assert_path_call_count(&paths, &pending_deployments_path(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_accepts_an_ambiguous_review_when_no_environment_remains_pending() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
         Mock::given(method("POST"))
             .and(path(review_path()))
-            .respond_with(
-                ResponseTemplate::new(204).set_delay(std::time::Duration::from_millis(500)),
-            )
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "There was a problem approving one of the gates"
+            })))
+            .expect(1)
+            .mount(&harness.server)
+            .await;
+        harness.mock_pending_deployments(false).await;
+
+        assert_no_content(
+            &harness
+                .enqueue(
+                    harness.webhook_request(
+                        "deployment_protection_rule",
+                        &harness.requested_payload(),
+                    ),
+                )
+                .await,
+        );
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({ "batchItemFailures": [] })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 1);
+        assert_path_call_count(&paths, &pending_deployments_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_accepts_a_successful_review_when_another_protection_rule_remains_pending() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        harness.mock_review_response(204, None).await;
+        harness.mock_pending_deployments(true).await;
+
+        assert_no_content(
+            &harness
+                .enqueue(
+                    harness.webhook_request(
+                        "deployment_protection_rule",
+                        &harness.requested_payload(),
+                    ),
+                )
+                .await,
+        );
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({ "batchItemFailures": [] })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 1);
+        assert_path_call_count(&paths, &pending_deployments_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_retries_a_partially_applied_review_before_returning_the_fifo_batch() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(review_path()))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "There was a problem approving one of the gates"
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&harness.server)
+            .await;
+        harness.mock_review_response(204, None).await;
+        Mock::given(method("GET"))
+            .and(path(pending_deployments_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "environment": { "name": "RELEASE" } }
+            ])))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&harness.server)
+            .await;
+        harness.mock_pending_deployments(false).await;
+
+        assert_no_content(
+            &harness
+                .enqueue(
+                    harness.webhook_request(
+                        "deployment_protection_rule",
+                        &harness.requested_payload(),
+                    ),
+                )
+                .await,
+        );
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({ "batchItemFailures": [] })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 2);
+        assert_path_call_count(&paths, &pending_deployments_path(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_processes_a_later_deployment_wave_for_the_same_run() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        harness.mock_review_response(204, None).await;
+        harness.mock_pending_deployments(false).await;
+
+        for index in 1..=2 {
+            let mut payload = harness.requested_payload();
+            payload["deployment"]["id"] = json!(5525311100_u64 + index);
+            assert_no_content(
+                &harness
+                    .enqueue(harness.webhook_request_with_delivery(
+                        "deployment_protection_rule",
+                        &payload,
+                        &format!("00000000-0000-4000-8000-{index:012x}"),
+                    ))
+                    .await,
+            );
+            let messages = harness
+                .webhook_config
+                .deployment_review_queue
+                .take_messages();
+            assert_eq!(
+                harness.process_batch(&messages).await,
+                json!({ "batchItemFailures": [] })
+            );
+        }
+
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 2);
+        assert_path_call_count(&paths, &pending_deployments_path(), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_returns_every_coalesced_message_when_an_ambiguous_review_stays_pending() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(review_path()))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "There was a problem approving one of the gates"
+            })))
             .expect(2)
             .mount(&harness.server)
             .await;
+        harness.mock_pending_deployments(true).await;
 
-        let first_harness = harness.clone();
-        let first = tokio::spawn(async move {
-            first_harness
-                .dispatch(first_harness.webhook_request(
-                    "deployment_protection_rule",
-                    &first_harness.requested_payload(),
-                ))
-                .await
-        });
-
-        for _ in 0..100 {
-            if harness
-                .received_paths()
-                .await
-                .iter()
-                .any(|path| path == &review_path())
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        for index in 1..=10 {
+            let mut payload = harness.requested_payload();
+            payload["deployment"]["id"] = json!(5525311100_u64 + index);
+            assert_no_content(
+                &harness
+                    .enqueue(harness.webhook_request_with_delivery(
+                        "deployment_protection_rule",
+                        &payload,
+                        &format!("00000000-0000-4000-8000-{index:012x}"),
+                    ))
+                    .await,
+            );
         }
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({
+                "batchItemFailures": (0..10)
+                    .map(|index| json!({ "itemIdentifier": format!("message-{index}") }))
+                    .collect::<Vec<_>>()
+            })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 2);
+        assert_path_call_count(&paths, &pending_deployments_path(), 2);
+    }
 
-        let second_harness = harness.clone();
-        let second = tokio::spawn(async move {
-            second_harness
-                .dispatch(second_harness.webhook_request(
-                    "deployment_protection_rule",
-                    &second_harness.requested_payload(),
-                ))
-                .await
-        });
+    #[tokio::test]
+    async fn worker_defers_rate_limited_reviews_instead_of_immediately_reposting() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(review_path()))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "message": "You have exceeded a secondary rate limit"
+            })))
+            .expect(1)
+            .mount(&harness.server)
+            .await;
+        harness.mock_pending_deployments(true).await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_path_call_count(&harness.received_paths().await, &review_path(), 1);
+        assert_no_content(
+            &harness
+                .enqueue(
+                    harness.webhook_request(
+                        "deployment_protection_rule",
+                        &harness.requested_payload(),
+                    ),
+                )
+                .await,
+        );
+        let messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({
+                "batchItemFailures": [{ "itemIdentifier": "message-0" }]
+            })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 1);
+        assert_path_call_count(&paths, &pending_deployments_path(), 1);
+    }
 
-        assert_no_content(&first.await.unwrap());
-        assert_no_content(&second.await.unwrap());
-        assert_path_call_count(&harness.received_paths().await, &review_path(), 2);
+    #[tokio::test]
+    async fn worker_returns_malformed_fifo_records_without_calling_github() {
+        let harness = Harness::new().await;
+        let event = serde_json::from_value(json!({
+            "Records": [
+                {
+                    "messageId": "invalid-message",
+                    "body": "not-json",
+                    "attributes": { "MessageGroupId": "not-a-group" }
+                },
+                {
+                    "messageId": "unprocessed-message",
+                    "body": "{}",
+                    "attributes": { "MessageGroupId": "not-a-group" }
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(
+                crate::worker::handle_batch(harness.config.clone(), event)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({
+                "batchItemFailures": [
+                    { "itemIdentifier": "invalid-message" },
+                    { "itemIdentifier": "unprocessed-message" }
+                ]
+            })
+        );
+        assert!(harness.received_paths().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_block_a_valid_fifo_group_behind_a_malformed_group() {
+        let harness = Harness::new().await;
+        harness.mock_installation_token(201).await;
+        harness
+            .mock_workflow_run_path(".github/workflows/release.yml")
+            .await;
+        harness.mock_gate_deployment().await;
+        harness.mock_gate_deployment_status("success").await;
+        harness
+            .mock_gate_workflow_job("release-gate", "success", RUN_ID, SHA)
+            .await;
+        harness.mock_review_response(204, None).await;
+        harness.mock_pending_deployments(false).await;
+        assert_no_content(
+            &harness
+                .enqueue(
+                    harness.webhook_request(
+                        "deployment_protection_rule",
+                        &harness.requested_payload(),
+                    ),
+                )
+                .await,
+        );
+        let valid = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        let event = serde_json::from_value(json!({
+            "Records": [
+                {
+                    "messageId": "invalid-message",
+                    "body": "not-json",
+                    "attributes": { "MessageGroupId": "invalid-group" }
+                },
+                {
+                    "messageId": "valid-message",
+                    "body": valid[0].body,
+                    "attributes": { "MessageGroupId": valid[0].group_id }
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(
+                crate::worker::handle_batch(harness.config.clone(), event)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({
+                "batchItemFailures": [{ "itemIdentifier": "invalid-message" }]
+            })
+        );
+        let paths = harness.received_paths().await;
+        assert_path_call_count(&paths, &review_path(), 1);
+        assert_path_call_count(&paths, &pending_deployments_path(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_a_tampered_fifo_group_and_callback_before_calling_github() {
+        let harness = Harness::new().await;
+        assert_no_content(
+            &harness
+                .enqueue(
+                    harness.webhook_request(
+                        "deployment_protection_rule",
+                        &harness.requested_payload(),
+                    ),
+                )
+                .await,
+        );
+        let mut messages = harness
+            .webhook_config
+            .deployment_review_queue
+            .take_messages();
+        let original_body = messages[0].body.clone();
+
+        messages[0].group_id = "invalid-group".to_string();
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({
+                "batchItemFailures": [{ "itemIdentifier": "message-0" }]
+            })
+        );
+
+        let mut body: Value = serde_json::from_str(&original_body).unwrap();
+        body["payload"]["deployment_callback_url"] = json!(
+            "https://api.github.com/repos/evil/tools/actions/runs/1/deployment_protection_rule"
+        );
+        messages[0].body = serde_json::to_string(&body).unwrap();
+        messages[0].group_id = crate::queue::deployment_review_group_id(
+            &crate::github::RequestedDeploymentProtection::parse(
+                serde_json::from_value(harness.requested_payload()).unwrap(),
+                &harness.config.github_api_base,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            harness.process_batch(&messages).await,
+            json!({
+                "batchItemFailures": [{ "itemIdentifier": "message-0" }]
+            })
+        );
+        assert!(harness.received_paths().await.is_empty());
     }
 
     #[tokio::test]
@@ -2141,7 +2894,7 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(422).set_body_json(json!({
                 "message": "There was a problem approving one of the gates"
             })))
-            .expect(2)
+            .expect(1)
             .mount(&harness.server)
             .await;
 

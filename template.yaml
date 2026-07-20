@@ -1,17 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  ost-environment-gate - GitHub deployment protection rule webhook handler.
+  ost-environment-gate - validates GitHub deployment protection webhooks,
+  queues them, and serializes environment reviews.
 
 Globals:
   Function:
     Runtime: provided.al2023
     Architectures:
       - arm64
-    # This exceeds GitHub's 10s webhook response expectation, but the critical
-    # deployment approval/rejection is written back via the deployments API and
-    # can still complete even if GitHub marks the webhook delivery as failed.
-    Timeout: 60
     MemorySize: 256
 
 Parameters:
@@ -27,41 +24,160 @@ Parameters:
   WebhookSecretParameterName:
     Type: String
     Default: /ost/webhook-secret
+  AlarmTopicArn:
+    Type: String
+    Description: SNS topic ARN for environment-gate alarm notifications
 
 Resources:
   Api:
     Type: AWS::Serverless::HttpApi
-
-  DeploymentReviewLockTable:
-    Type: AWS::DynamoDB::Table
     Properties:
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: lock_key
-          AttributeType: S
-      KeySchema:
-        - AttributeName: lock_key
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: expires_at
-        Enabled: true
-      SSESpecification:
-        SSEEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency"}
 
-  EnvironmentGateFunction:
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/${AWS::StackName}/http-api
+      RetentionInDays: 30
+
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-webhook
+      RetentionInDays: 30
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-worker
+      RetentionInDays: 30
+
+  DeploymentReviewDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-reviews-dlq.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-reviews.fifo
+
+  DeploymentReviewQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-reviews.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      DelaySeconds: 2
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeploymentReviewDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  DeploymentReviewQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeploymentReviewQueue
+        - !Ref DeploymentReviewDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnauthenticatedWebhookProducers
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeploymentReviewQueue.Arn
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn:
+                  - !GetAtt WebhookFunctionRole.Arn
+                  - !GetAtt DeploymentReviewRedriveRole.Arn
+          - Sid: DenyDirectRedriveRoleSends
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeploymentReviewQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !GetAtt DeploymentReviewRedriveRole.Arn
+              StringNotEquals:
+                aws:CalledViaLast: sqs.amazonaws.com
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - !GetAtt DeploymentReviewQueue.Arn
+              - !GetAtt DeploymentReviewDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  DeploymentReviewRedriveRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deployment-review-redrive
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:StartMessageMoveTask
+                  - sqs:CancelMessageMoveTask
+                  - sqs:ListMessageMoveTasks
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ListDeadLetterSourceQueues
+                Resource: !GetAtt DeploymentReviewDeadLetterQueue.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeploymentReviewQueue.Arn
+                Condition:
+                  StringEquals:
+                    aws:CalledViaLast: sqs.amazonaws.com
+
+  WebhookFunction:
     Type: AWS::Serverless::Function
     Metadata:
       BuildMethod: rust-cargolambda
+      BuildProperties:
+        Binary: ost-environment-gate
     Properties:
       CodeUri: .
       Handler: bootstrap
+      FunctionName: !Sub ${AWS::StackName}-webhook
+      Timeout: 8
+      ReservedConcurrentExecutions: 100
+      LoggingConfig:
+        LogGroup: !Ref WebhookLogGroup
       Environment:
         Variables:
-          POLICY_JSON: !Ref PolicyJson
-          APP_ID_PARAMETER: !Ref AppIdParameterName
-          APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
           WEBHOOK_SECRET_PARAMETER: !Ref WebhookSecretParameterName
-          DEPLOYMENT_REVIEW_LOCK_TABLE: !Ref DeploymentReviewLockTable
+          DEPLOYMENT_REVIEW_QUEUE_URL: !Ref DeploymentReviewQueue
           RUST_LOG: info
       Events:
         Health:
@@ -79,20 +195,188 @@ Resources:
       Policies:
         - Statement:
             - Effect: Allow
-              Action:
-                - ssm:GetParameter
-              Resource:
-                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AppIdParameterName}
-                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WebhookSecretParameterName}
+              Action: sqs:SendMessage
+              Resource: !GetAtt DeploymentReviewQueue.Arn
             - Effect: Allow
-              Action:
-                - secretsmanager:GetSecretValue
+              Action: ssm:GetParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WebhookSecretParameterName}
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+      BuildProperties:
+        Binary: ost-environment-gate
+    Properties:
+      CodeUri: .
+      Handler: bootstrap
+      FunctionName: !Sub ${AWS::StackName}-worker
+      Timeout: 120
+      ReservedConcurrentExecutions: 2
+      LoggingConfig:
+        LogGroup: !Ref WorkerLogGroup
+      Environment:
+        Variables:
+          HANDLER_MODE: worker
+          POLICY_JSON: !Ref PolicyJson
+          APP_ID_PARAMETER: !Ref AppIdParameterName
+          APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
+          RUST_LOG: info
+      Events:
+        DeploymentReviews:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DeploymentReviewQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 2
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt DeploymentReviewQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AppIdParameterName}
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}*
-            - Effect: Allow
-              Action:
-                - dynamodb:PutItem
-                - dynamodb:DeleteItem
-              Resource: !GetAtt DeploymentReviewLockTable.Arn
+
+  WebhookErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda errors while receiving environment-gate webhooks
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicArn
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda errors while processing environment reviews
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicArn
+
+  WorkerThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda throttles while processing environment reviews
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicArn
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: HTTP API errors while receiving environment-gate webhooks
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref Api
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicArn
+
+  DeploymentReviewDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Environment reviews that exhausted worker retries
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeploymentReviewDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicArn
+
+  DeploymentReviewQueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Environment reviews waiting too long to be processed
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeploymentReviewQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicArn
+
+  DeploymentReviewFailureMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref WorkerLogGroup
+      FilterPattern: '{ $.fields.outcome = "retry" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub ${AWS::StackName}/reviews
+          MetricName: FailedReviewBatches
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  DeploymentReviewFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Environment-review batches returned for retry
+      Namespace: !Sub ${AWS::StackName}/reviews
+      MetricName: FailedReviewBatches
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
 Outputs:
   ApiUrl:
@@ -101,3 +385,12 @@ Outputs:
   WebhookUrl:
     Description: Full GitHub webhook URL
     Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/github/webhook
+  DeploymentReviewQueueUrl:
+    Description: FIFO queue used for authenticated deployment-protection requests
+    Value: !Ref DeploymentReviewQueue
+  DeploymentReviewDeadLetterQueueUrl:
+    Description: FIFO queue containing deployment reviews that exhausted retries
+    Value: !Ref DeploymentReviewDeadLetterQueue
+  DeploymentReviewRedriveRoleArn:
+    Description: Role operators can assume to redrive failed deployment reviews
+    Value: !GetAtt DeploymentReviewRedriveRole.Arn

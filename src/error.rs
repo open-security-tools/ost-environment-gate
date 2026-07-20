@@ -21,6 +21,8 @@ pub enum AppError {
     NotFound,
     #[error("invalid github webhook signature")]
     InvalidGithubWebhookSignature,
+    #[error("missing or invalid github delivery id")]
+    InvalidGithubDelivery,
     #[error("deployment protection payload is invalid")]
     DeploymentProtectionPayloadInvalid,
     #[error("deployment protection payload is missing a valid workflow run id")]
@@ -41,14 +43,14 @@ pub enum AppError {
     WorkflowJobLookupFailed,
     #[error("github deployment lookup failed")]
     DeploymentLookupFailed,
-    #[error("deployment review lock is not configured")]
-    DeploymentReviewLockNotConfigured,
-    #[error("timed out waiting for deployment review lock")]
-    DeploymentReviewLockTimeout,
-    #[error("deployment review lock failed")]
-    DeploymentReviewLockFailed,
+    #[error("deployment review queue is not configured")]
+    DeploymentReviewQueueNotConfigured,
+    #[error("deployment review queue is unavailable")]
+    DeploymentReviewQueueUnavailable,
     #[error("github deployment protection review failed")]
     DeploymentProtectionReviewFailed,
+    #[error("github deployment protection review failed")]
+    DeploymentProtectionReviewAmbiguous { retry_after_seconds: Option<u64> },
 }
 
 impl AppError {
@@ -64,6 +66,7 @@ impl AppError {
             Self::MissingWebhookEvent => "missing_webhook_event",
             Self::NotFound => "not_found",
             Self::InvalidGithubWebhookSignature => "invalid_github_webhook_signature",
+            Self::InvalidGithubDelivery => "invalid_github_delivery",
             Self::DeploymentProtectionPayloadInvalid => "deployment_protection_payload_invalid",
             Self::DeploymentProtectionRunIdInvalid => "deployment_protection_run_id_invalid",
             Self::GithubAppAuthInvalid => "github_app_auth_invalid",
@@ -74,10 +77,12 @@ impl AppError {
             Self::WorkflowRunLookupFailed => "workflow_run_lookup_failed",
             Self::WorkflowJobLookupFailed => "workflow_job_lookup_failed",
             Self::DeploymentLookupFailed => "deployment_lookup_failed",
-            Self::DeploymentReviewLockNotConfigured => "deployment_review_lock_not_configured",
-            Self::DeploymentReviewLockTimeout => "deployment_review_lock_timeout",
-            Self::DeploymentReviewLockFailed => "deployment_review_lock_failed",
+            Self::DeploymentReviewQueueNotConfigured => "deployment_review_queue_not_configured",
+            Self::DeploymentReviewQueueUnavailable => "deployment_review_queue_unavailable",
             Self::DeploymentProtectionReviewFailed => "deployment_protection_review_failed",
+            Self::DeploymentProtectionReviewAmbiguous { .. } => {
+                "deployment_protection_review_failed"
+            }
         }
     }
 
@@ -90,10 +95,11 @@ impl AppError {
             | Self::AppPrivateKeyNotConfigured
             | Self::WebhookSecretNotConfigured
             | Self::InvalidGithubApiUrl
-            | Self::DeploymentReviewLockNotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::DeploymentReviewQueueNotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
             Self::MissingWebhookEvent => StatusCode::BAD_REQUEST,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidGithubWebhookSignature => StatusCode::UNAUTHORIZED,
+            Self::InvalidGithubDelivery => StatusCode::BAD_REQUEST,
             Self::DeploymentProtectionPayloadInvalid => StatusCode::BAD_REQUEST,
             Self::DeploymentProtectionRunIdInvalid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::GithubAppAuthInvalid | Self::GithubAccessTokenRequestForbidden => {
@@ -101,13 +107,13 @@ impl AppError {
             }
             Self::InstallationNotFound => StatusCode::FORBIDDEN,
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::DeploymentReviewLockTimeout => StatusCode::SERVICE_UNAVAILABLE,
+            Self::DeploymentReviewQueueUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::GithubAccessTokenRequestFailed
             | Self::WorkflowRunLookupFailed
             | Self::WorkflowJobLookupFailed
             | Self::DeploymentLookupFailed
-            | Self::DeploymentReviewLockFailed
-            | Self::DeploymentProtectionReviewFailed => StatusCode::BAD_GATEWAY,
+            | Self::DeploymentProtectionReviewFailed
+            | Self::DeploymentProtectionReviewAmbiguous { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 }

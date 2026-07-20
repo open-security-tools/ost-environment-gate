@@ -66,9 +66,10 @@ mod workflows;
 pub use api::{github_api_url, github_request, send_github_request, GithubApiBase};
 pub use deployments::{
     fetch_environment_deployments, fetch_latest_deployment_status,
-    review_deployment_protection_rule, DeploymentProtectionRulePayload,
-    DeploymentProtectionRuleReviewPayload, DeploymentProtectionRuleReviewState, DeploymentState,
-    DeploymentStatusSummary, RefName, RequestedDeploymentProtection,
+    has_pending_deployment_protection_rule, review_deployment_protection_rule,
+    DeploymentProtectionRulePayload, DeploymentProtectionRuleReviewPayload,
+    DeploymentProtectionRuleReviewState, DeploymentState, DeploymentStatusSummary, RefName,
+    RequestedDeploymentProtection,
 };
 pub use repositories::{Repository, RepositoryId};
 pub use tokens::{create_app_jwt, mint_installation_token, InstallationId, Token};

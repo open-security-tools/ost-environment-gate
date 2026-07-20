@@ -81,7 +81,7 @@ The GitHub App requires the minimum permissions to perform this action.
 
 ## Webhook
 
-The webhook API is implemented in Rust and deployed as a Lambda via AWS SAM.
+The webhook API is implemented in Rust and deployed as Lambda functions via AWS SAM.
 
 The GitHub App ID and webhook secret are stored in AWS SSM Parameter Store. The GitHub App's private
 key is stored in AWS Secrets Manager.
@@ -90,16 +90,14 @@ The webhook lifecycle is roughly:
 
 1. Receive a `deployment_protection_rule` event from GitHub (other events are discarded)
 1. Validate the event is authentic using the webhook secret
+1. Enqueue the validated request in the deployment-review FIFO queue and return HTTP 204
+1. Coalesce requests for the same repository, workflow run, and environment in the worker
 1. Use the private key to mint a JWT then exchange JWT for a GitHub access token
-1. Extract the workflow run id from the event
 1. Look up deployments for the configured environment and the same commit SHA
 1. Read the latest status for the matching deployment
 1. Extract the job run from the deployment status
 1. Approve or deny the deployment according to the policy
-1. Acquire the per-repository, workflow-run, and environment review lock
-1. Submit the deployment protection review, retrying an ambiguous concurrent-review response once
-1. Release the review lock
-1. Return an HTTP 204 indicating successful event receipt
+1. Submit the deployment protection review and reconcile ambiguous outcomes with pending state
 
 Requests to the following GitHub routes are expected:
 
@@ -109,18 +107,12 @@ Requests to the following GitHub routes are expected:
 - `GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses`
 - `GET /repos/{owner}/{repo}/actions/jobs/{job_id}`
 - `POST /repos/{owner}/{repo}/actions/runs/{run_id}/deployment_protection_rule`
+- `GET /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments`
 
-Large matrix workflows can request the same protected environment concurrently. The service uses a
-short-lived DynamoDB lock to serialize only the final review call for a repository, workflow run,
-and environment; policy evaluation and unrelated runs remain concurrent. Lock records expire after
-90 seconds so an interrupted invocation cannot permanently block a release. If GitHub returns its
-ambiguous `There was a problem approving one of the gates` response, the service retries the review
-once while the lock is held. Known already-reviewed and no-pending-deployment responses remain
-idempotent successes.
-
-Structured webhook logs include `X-GitHub-Delivery` as `delivery_id` and attach the repository,
-workflow run id, environment, decision, and GitHub review status/body to review failures, allowing
-failed deliveries to be correlated and redelivered.
+Large matrix workflows can request the same protected environment concurrently. The FIFO queue
+serializes and coalesces reviews per repository, workflow run, and environment; failed or partially
+applied reviews are retried durably and surfaced through the dead-letter queue. The stack provides
+`DeploymentReviewRedriveRoleArn` for securely redriving failed reviews.
 
 ## Policy
 

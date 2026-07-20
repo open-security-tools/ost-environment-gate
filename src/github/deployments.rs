@@ -1,7 +1,5 @@
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     config::{EnvironmentName, GitRef},
@@ -16,13 +14,11 @@ const REQUESTED_ACTION: &str = "requested";
 const DEPLOYMENTS_PER_PAGE: usize = 100;
 const DEPLOYMENTS_PER_PAGE_QUERY: &str = "100";
 const MAX_ENVIRONMENT_DEPLOYMENT_PAGES: usize = 10;
-const AMBIGUOUS_REVIEW_MAX_ATTEMPTS: usize = 2;
-const AMBIGUOUS_REVIEW_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Mirrors the inbound `deployment_protection_rule` webhook payload shape from GitHub.
 ///
 /// See <https://docs.github.com/en/webhooks/webhook-events-and-payloads#deployment_protection_rule>.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeploymentProtectionRulePayload {
     pub action: Option<String>,
     pub environment: Option<String>,
@@ -30,19 +26,20 @@ pub struct DeploymentProtectionRulePayload {
     pub git_ref: Option<String>,
     pub sha: Option<String>,
     pub deployment_callback_url: Option<String>,
+    pub deployment: Option<DeploymentRef>,
     pub installation: Option<InstallationRef>,
     pub repository: Option<RepositoryPayload>,
     pub workflow_run: Option<WorkflowRunRef>,
 }
 
 /// Captures the installation reference nested inside a webhook payload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InstallationRef {
     pub id: Option<u64>,
 }
 
 /// Captures the repository object nested inside a webhook payload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RepositoryPayload {
     pub id: Option<u64>,
     pub full_name: Option<String>,
@@ -51,14 +48,20 @@ pub struct RepositoryPayload {
 }
 
 /// Captures the owner object nested inside a repository payload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OwnerPayload {
     pub login: Option<String>,
 }
 
 /// Captures the workflow run reference nested inside a webhook payload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkflowRunRef {
+    pub id: Option<u64>,
+}
+
+/// Captures the deployment reference nested inside a webhook payload.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DeploymentRef {
     pub id: Option<u64>,
 }
 
@@ -101,6 +104,7 @@ pub struct RequestedDeploymentProtection {
     pub repository: Repository,
     pub repository_id: RepositoryId,
     pub run_id: RunId,
+    pub deployment_id: Option<DeploymentId>,
     pub deployment_callback_url: DeploymentCallbackUrl,
     /// Prevents direct struct-literal construction outside this module.
     _private: (),
@@ -116,6 +120,16 @@ pub struct DeploymentStatusSummary {
     pub state: DeploymentState,
     pub target_url: Option<String>,
     pub log_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingDeployment {
+    environment: PendingDeploymentEnvironment,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingDeploymentEnvironment {
+    name: String,
 }
 
 crate::impl_string_newtype!(
@@ -301,6 +315,10 @@ impl RequestedDeploymentProtection {
             repository,
             repository_id,
             run_id,
+            deployment_id: payload
+                .deployment
+                .and_then(|deployment| deployment.id)
+                .and_then(DeploymentId::new),
             deployment_callback_url,
             _private: (),
         })
@@ -494,76 +512,155 @@ pub async fn review_deployment_protection_rule(
     payload: &DeploymentProtectionRuleReviewPayload<'_>,
 ) -> Result<(), AppError> {
     let url = deployment_callback_url.as_url().clone();
-
-    for attempt in 1..=AMBIGUOUS_REVIEW_MAX_ATTEMPTS {
-        let response = send_github_request(
-            github_request(http_client.post(url.clone()), installation_token).json(payload),
-            "deployment protection review",
-        )
+    let response = github_request(http_client.post(url), installation_token)
+        .json(payload)
+        .send()
         .await
         .map_err(|error| {
-            tracing::error!(?error, attempt, "deployment protection review failed");
-            AppError::DeploymentProtectionReviewFailed
-        })?;
-
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        let status = response.status();
-        let response_body = response.text().await.map_err(|error| {
-            tracing::error!(
-                ?error,
-                attempt,
-                status = %status,
-                "failed to read deployment protection review error response body"
-            );
-            AppError::DeploymentProtectionReviewFailed
-        })?;
-
-        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            match review_422_reason(&response_body) {
-                Some(
-                    reason @ (Review422Reason::NoPendingDeploymentRequests
-                    | Review422Reason::AlreadyReviewed),
-                ) => {
-                    tracing::warn!(
-                        attempt,
-                        status = %status,
-                        reason = %reason,
-                        response_body = %response_body,
-                        "deployment protection review already processed; treating status as success"
-                    );
-                    return Ok(());
-                }
-                Some(reason @ Review422Reason::AmbiguousConcurrentReview)
-                    if attempt < AMBIGUOUS_REVIEW_MAX_ATTEMPTS =>
-                {
-                    tracing::warn!(
-                        attempt,
-                        status = %status,
-                        reason = %reason,
-                        retry_delay_ms = AMBIGUOUS_REVIEW_RETRY_DELAY.as_millis(),
-                        response_body = %response_body,
-                        "deployment protection review returned ambiguous status; retrying"
-                    );
-                    sleep(AMBIGUOUS_REVIEW_RETRY_DELAY).await;
-                    continue;
-                }
-                _ => {}
+            tracing::error!(?error, "deployment protection review failed");
+            AppError::DeploymentProtectionReviewAmbiguous {
+                retry_after_seconds: None,
             }
-        }
+        })?;
 
-        tracing::error!(
-            attempt,
-            status = %status,
-            response_body = %response_body,
-            "unexpected deployment protection review status"
-        );
-        return Err(AppError::DeploymentProtectionReviewFailed);
+    if response.status().is_success() {
+        return Ok(());
     }
 
-    unreachable!("deployment protection review loop always returns or retries")
+    let status = response.status();
+    let retry_after_seconds = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let rate_limit_reset_seconds = response
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|reset| {
+            reset.saturating_sub(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+        });
+    let response_body = response.text().await.map_err(|error| {
+        tracing::error!(
+            ?error,
+            status = %status,
+            "failed to read deployment protection review error response body"
+        );
+        AppError::DeploymentProtectionReviewAmbiguous {
+            retry_after_seconds,
+        }
+    })?;
+
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        match review_422_reason(&response_body) {
+            Some(
+                reason @ (Review422Reason::NoPendingDeploymentRequests
+                | Review422Reason::AlreadyReviewed),
+            ) => {
+                tracing::warn!(
+                    status = %status,
+                    reason = %reason,
+                    response_body = %response_body,
+                    "deployment protection review already processed; treating status as success"
+                );
+                return Ok(());
+            }
+            Some(reason @ Review422Reason::AmbiguousConcurrentReview) => {
+                tracing::warn!(
+                    status = %status,
+                    reason = %reason,
+                    response_body = %response_body,
+                    "deployment protection review returned an ambiguous status"
+                );
+                return Err(AppError::DeploymentProtectionReviewAmbiguous {
+                    retry_after_seconds,
+                });
+            }
+            None => {}
+        }
+    }
+
+    let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && (retry_after_seconds.is_some()
+                || response_body.to_ascii_lowercase().contains("rate limit")));
+    let retry_after_seconds = if rate_limited {
+        retry_after_seconds
+            .or(rate_limit_reset_seconds)
+            .map_or(Some(60), |seconds| Some(seconds.max(60)))
+    } else {
+        retry_after_seconds
+    };
+    let error = if rate_limited || status.is_server_error() {
+        AppError::DeploymentProtectionReviewAmbiguous {
+            retry_after_seconds,
+        }
+    } else {
+        AppError::DeploymentProtectionReviewFailed
+    };
+    tracing::error!(
+        status = %status,
+        response_body = %response_body,
+        "unexpected deployment protection review status"
+    );
+    Err(error)
+}
+
+/// Returns whether the requested environment is still waiting for protection rules to pass.
+pub async fn has_pending_deployment_protection_rule(
+    http_client: &reqwest::Client,
+    github_api_base: &GithubApiBase,
+    installation_token: &Token,
+    repository: &Repository,
+    run_id: RunId,
+    environment: &str,
+) -> Result<bool, AppError> {
+    let url = github_api_url(
+        github_api_base,
+        &format!(
+            "repos/{}/{}/actions/runs/{run_id}/pending_deployments",
+            repository.owner().as_str(),
+            repository.name().as_str(),
+        ),
+    )?;
+    let response = send_github_request(
+        github_request(http_client.get(url), installation_token),
+        "pending deployment lookup",
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(?error, %repository, %run_id, "pending deployment lookup failed");
+        AppError::DeploymentLookupFailed
+    })?;
+
+    if !response.status().is_success() {
+        tracing::error!(
+            status = %response.status(),
+            %repository,
+            %run_id,
+            "unexpected pending deployment lookup status"
+        );
+        return Err(AppError::DeploymentLookupFailed);
+    }
+
+    response
+        .json::<Vec<PendingDeployment>>()
+        .await
+        .map(|deployments| {
+            deployments
+                .into_iter()
+                .any(|deployment| deployment.environment.name.eq_ignore_ascii_case(environment))
+        })
+        .map_err(|error| {
+            tracing::error!(?error, %repository, %run_id, "failed to decode pending deployment response");
+            AppError::DeploymentLookupFailed
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -642,9 +739,10 @@ fn review_422_reason(body: &str) -> Option<Review422Reason> {
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_environment_deployments, fetch_latest_deployment_status, review_422_reason,
-        CommitSha, DeploymentCallbackUrl, DeploymentId, DeploymentProtectionRulePayload,
-        DeploymentState, RefName, RequestedDeploymentProtection,
+        fetch_environment_deployments, fetch_latest_deployment_status,
+        has_pending_deployment_protection_rule, review_422_reason, CommitSha,
+        DeploymentCallbackUrl, DeploymentId, DeploymentProtectionRulePayload, DeploymentState,
+        RefName, RequestedDeploymentProtection,
     };
     use crate::config::{EnvironmentName, GitRef, Policy};
     use crate::error::AppError;
@@ -873,6 +971,7 @@ mod tests {
             "release-authenticator-example"
         );
         assert_eq!(*requested.run_id, 23625057533);
+        assert_eq!(*requested.deployment_id.unwrap(), 4189575565);
     }
 
     #[test]
@@ -1219,5 +1318,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(state, None);
+    }
+
+    #[tokio::test]
+    async fn pending_deployment_lookup_matches_environment_case_insensitively() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/actions/runs/7/pending_deployments"))
+            .and(header("authorization", "Bearer token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "environment": { "name": "Release" } }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(has_pending_deployment_protection_rule(
+            &reqwest::Client::new(),
+            &server.uri().try_into().unwrap(),
+            &serde_json::from_value::<Token>(json!("token")).unwrap(),
+            &String::from("octo/tools").try_into().unwrap(),
+            RunId::new(7).unwrap(),
+            "release",
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn pending_deployment_lookup_returns_false_for_other_environments() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/actions/runs/7/pending_deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "environment": { "name": "staging" } }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(!has_pending_deployment_protection_rule(
+            &reqwest::Client::new(),
+            &server.uri().try_into().unwrap(),
+            &serde_json::from_value::<Token>(json!("token")).unwrap(),
+            &String::from("octo/tools").try_into().unwrap(),
+            RunId::new(7).unwrap(),
+            "release",
+        )
+        .await
+        .unwrap());
     }
 }
