@@ -8,8 +8,13 @@ use crate::{
         WorkflowJobUrlReference, WorkflowRunSummary,
     },
 };
+use std::time::Duration;
+use tracing::Instrument;
 
 const REQUESTED_ACTION: &str = "requested";
+const QUEUED_REVIEW_MAX_ATTEMPTS: usize = 2;
+const QUEUED_REVIEW_RETRY_DELAY: Duration = Duration::from_secs(2);
+const QUEUED_REVIEW_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Represents the approval state sent back to GitHub for a release gate decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -78,9 +83,26 @@ impl std::fmt::Display for ReleaseProtectionState {
 }
 
 /// Evaluates a deployment protection webhook and submits the resulting review to GitHub.
+#[cfg(test)]
 pub async fn handle_deployment_protection_rule_webhook(
     config: Config,
     body: &[u8],
+) -> Result<DeploymentProtectionRuleOutcome, AppError> {
+    handle_deployment_protection_rule(config, body, false).await
+}
+
+/// Evaluates a queued deployment protection request, submits one review, and verifies completion.
+pub async fn handle_queued_deployment_protection_rule(
+    config: Config,
+    body: &[u8],
+) -> Result<DeploymentProtectionRuleOutcome, AppError> {
+    handle_deployment_protection_rule(config, body, true).await
+}
+
+async fn handle_deployment_protection_rule(
+    config: Config,
+    body: &[u8],
+    verify_pending: bool,
 ) -> Result<DeploymentProtectionRuleOutcome, AppError> {
     let payload: DeploymentProtectionRulePayload =
         serde_json::from_slice(body).map_err(|_| AppError::DeploymentProtectionPayloadInvalid)?;
@@ -108,8 +130,10 @@ pub async fn handle_deployment_protection_rule_webhook(
     )
     .await?;
 
-    let decision = if requested.environment.as_str()
-        != config.policy.release_environment_name().as_str()
+    let decision = if !requested
+        .environment
+        .as_str()
+        .eq_ignore_ascii_case(config.policy.release_environment_name().as_str())
         || !requested
             .git_ref
             .as_ref()
@@ -164,19 +188,109 @@ pub async fn handle_deployment_protection_rule_webhook(
         }
     };
 
-    github::review_deployment_protection_rule(
-        &config.http_client,
-        &installation_token.token,
-        &requested.deployment_callback_url,
-        &DeploymentProtectionRuleReviewPayload {
-            environment_name: requested.environment.as_str(),
-            state: match decision.state {
-                ReleaseProtectionState::Approved => DeploymentProtectionRuleReviewState::Approved,
-                ReleaseProtectionState::Rejected => DeploymentProtectionRuleReviewState::Rejected,
-            },
-            comment: decision.comment.as_str(),
-        },
-    )
+    let review_span = tracing::info_span!(
+        "deployment_protection_review",
+        repository = %requested.repository,
+        run_id = *requested.run_id,
+        environment = %requested.environment,
+        state = %decision.state,
+        comment = %decision.comment
+    );
+    async {
+        let max_attempts = if verify_pending {
+            QUEUED_REVIEW_MAX_ATTEMPTS
+        } else {
+            1
+        };
+        for attempt in 1..=max_attempts {
+            let review_result = github::review_deployment_protection_rule(
+                &config.http_client,
+                &installation_token.token,
+                &requested.deployment_callback_url,
+                &DeploymentProtectionRuleReviewPayload {
+                    environment_name: requested.environment.as_str(),
+                    state: match decision.state {
+                        ReleaseProtectionState::Approved => {
+                            DeploymentProtectionRuleReviewState::Approved
+                        }
+                        ReleaseProtectionState::Rejected => {
+                            DeploymentProtectionRuleReviewState::Rejected
+                        }
+                    },
+                    comment: decision.comment.as_str(),
+                },
+            )
+            .await;
+
+            if !verify_pending {
+                return review_result;
+            }
+            if matches!(
+                review_result,
+                Err(AppError::DeploymentProtectionReviewFailed)
+            ) {
+                return review_result;
+            }
+
+            let pending = github::has_pending_deployment_protection_rule(
+                &config.http_client,
+                &config.github_api_base,
+                &installation_token.token,
+                &requested.repository,
+                requested.run_id,
+                requested.environment.as_str(),
+            )
+            .await?;
+
+            if !pending {
+                if review_result.is_err() {
+                    tracing::warn!(
+                        attempt,
+                        "deployment protection review reported an ambiguous outcome but no deployment remains pending"
+                    );
+                }
+                return Ok(());
+            }
+
+            if review_result.is_ok() {
+                tracing::warn!(
+                    attempt,
+                    "deployment protection review succeeded while another protection rule remains pending"
+                );
+                return Ok(());
+            }
+
+            tracing::warn!(
+                attempt,
+                review_failed = review_result.is_err(),
+                "deployment environment is still waiting after review"
+            );
+            if attempt < max_attempts {
+                let retry_delay = match &review_result {
+                    Err(AppError::DeploymentProtectionReviewAmbiguous {
+                        retry_after_seconds: Some(seconds),
+                    }) => Duration::from_secs(*seconds),
+                    _ => QUEUED_REVIEW_RETRY_DELAY,
+                }
+                .max(QUEUED_REVIEW_RETRY_DELAY);
+                if retry_delay > QUEUED_REVIEW_MAX_RETRY_DELAY {
+                    tracing::warn!(
+                        retry_after_seconds = retry_delay.as_secs(),
+                        "deployment protection review retry exceeds the re-invocation budget"
+                    );
+                    return Err(AppError::DeploymentProtectionReviewAmbiguous {
+                        retry_after_seconds: Some(retry_delay.as_secs()),
+                    });
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+
+        Err(AppError::DeploymentProtectionReviewAmbiguous {
+            retry_after_seconds: None,
+        })
+    }
+    .instrument(review_span)
     .await?;
 
     Ok(DeploymentProtectionRuleOutcome::Reviewed {
@@ -396,7 +510,11 @@ pub fn evaluate_release_protection(
     gate_deployment_state: Option<DeploymentState>,
     policy: &Policy,
 ) -> ReleaseProtectionDecision {
-    if requested.environment.as_str() != policy.release_environment_name().as_str() {
+    if !requested
+        .environment
+        .as_str()
+        .eq_ignore_ascii_case(policy.release_environment_name().as_str())
+    {
         return ReleaseProtectionDecision::rejected(format!(
             "environment {} is not allowed",
             requested.environment

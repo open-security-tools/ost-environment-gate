@@ -2,11 +2,12 @@ use std::{env, fmt, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
+use aws_sdk_sqs::Client as SqsClient;
 use aws_sdk_ssm::Client as SsmClient;
 use lambda_http::Error;
 use serde::Deserialize;
 
-use crate::{error::AppError, github::GithubApiBase};
+use crate::{error::AppError, github::GithubApiBase, queue::DeploymentReviewQueue};
 
 const WORKFLOWS_PREFIX: &str = ".github/workflows/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -379,9 +380,15 @@ pub struct Config {
     pub policy: Policy,
     pub app_id: AppId,
     pub app_private_key: AppPrivateKey,
-    pub webhook_secret: WebhookSecret,
     pub github_api_base: GithubApiBase,
     pub http_client: reqwest::Client,
+}
+
+#[derive(Clone)]
+pub struct WebhookConfig {
+    pub webhook_secret: WebhookSecret,
+    pub github_api_base: GithubApiBase,
+    pub deployment_review_queue: DeploymentReviewQueue,
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -412,11 +419,6 @@ impl Config {
             }
             Err(error) => return Err(error.into()),
         };
-        let webhook_secret = match WebhookSecret::from_env() {
-            Ok(webhook_secret) => webhook_secret,
-            Err(AppError::WebhookSecretNotConfigured) => WebhookSecret::from_ssm(&ssm).await?,
-            Err(error) => return Err(error.into()),
-        };
         let github_api_base = GithubApiBase::from_env()?;
         let http_client = build_http_client()?;
 
@@ -424,9 +426,29 @@ impl Config {
             policy,
             app_id,
             app_private_key,
-            webhook_secret,
             github_api_base,
             http_client,
+        })
+    }
+}
+
+impl WebhookConfig {
+    /// Loads the minimal configuration required to authenticate and enqueue webhooks.
+    pub async fn load() -> Result<Self, Error> {
+        let shared_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        let ssm = SsmClient::new(&shared_config);
+        let webhook_secret = match WebhookSecret::from_env() {
+            Ok(webhook_secret) => webhook_secret,
+            Err(AppError::WebhookSecretNotConfigured) => WebhookSecret::from_ssm(&ssm).await?,
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(Self {
+            webhook_secret,
+            github_api_base: GithubApiBase::from_env()?,
+            deployment_review_queue: DeploymentReviewQueue::from_env(SqsClient::new(
+                &shared_config,
+            ))?,
         })
     }
 }
