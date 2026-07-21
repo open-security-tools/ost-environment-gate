@@ -29,6 +29,19 @@ Resources:
   Api:
     Type: AWS::Serverless::HttpApi
 
+  DeploymentReviewDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-reviews-dlq.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-reviews.fifo
+
   DeploymentReviewQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -39,6 +52,81 @@ Resources:
       VisibilityTimeout: 720
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeploymentReviewDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  DeploymentReviewQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeploymentReviewQueue
+        - !Ref DeploymentReviewDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnauthenticatedWebhookProducers
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeploymentReviewQueue.Arn
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn:
+                  - !GetAtt WebhookFunctionRole.Arn
+                  - !GetAtt DeploymentReviewRedriveRole.Arn
+          - Sid: DenyDirectRedriveRoleSends
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeploymentReviewQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !GetAtt DeploymentReviewRedriveRole.Arn
+              StringNotEquals:
+                aws:CalledViaLast: sqs.amazonaws.com
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - !GetAtt DeploymentReviewQueue.Arn
+              - !GetAtt DeploymentReviewDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  DeploymentReviewRedriveRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deployment-review-redrive
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:StartMessageMoveTask
+                  - sqs:CancelMessageMoveTask
+                  - sqs:ListMessageMoveTasks
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ListDeadLetterSourceQueues
+                Resource: !GetAtt DeploymentReviewDeadLetterQueue.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeploymentReviewQueue.Arn
+                Condition:
+                  StringEquals:
+                    aws:CalledViaLast: sqs.amazonaws.com
 
   WebhookFunction:
     Type: AWS::Serverless::Function
@@ -129,3 +217,9 @@ Outputs:
   DeploymentReviewQueueUrl:
     Description: FIFO queue used for authenticated deployment-protection requests
     Value: !Ref DeploymentReviewQueue
+  DeploymentReviewDeadLetterQueueUrl:
+    Description: FIFO queue containing deployment reviews that exhausted retries
+    Value: !Ref DeploymentReviewDeadLetterQueue
+  DeploymentReviewRedriveRoleArn:
+    Description: Role operators can assume to redrive failed deployment reviews
+    Value: !GetAtt DeploymentReviewRedriveRole.Arn

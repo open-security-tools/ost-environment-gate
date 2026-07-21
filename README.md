@@ -111,7 +111,8 @@ Requests to the following GitHub routes are expected:
 
 Large matrix workflows can request the same protected environment concurrently. The FIFO queue
 serializes and coalesces reviews per repository, workflow run, and environment; failed or partially
-applied reviews are retried durably.
+applied reviews are retried durably and surfaced through the dead-letter queue. The stack provides
+`DeploymentReviewRedriveRoleArn` for securely redriving failed reviews.
 
 ## Policy
 
