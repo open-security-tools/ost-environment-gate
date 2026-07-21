@@ -276,7 +276,7 @@ async fn handle_deployment_protection_rule(
                 if retry_delay > QUEUED_REVIEW_MAX_RETRY_DELAY {
                     tracing::warn!(
                         retry_after_seconds = retry_delay.as_secs(),
-                        "deployment protection review retry exceeds the in-invocation budget"
+                        "deployment protection review retry exceeds the re-invocation budget"
                     );
                     return Err(AppError::DeploymentProtectionReviewAmbiguous {
                         retry_after_seconds: Some(retry_delay.as_secs()),

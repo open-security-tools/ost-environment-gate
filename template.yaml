@@ -56,6 +56,7 @@ Resources:
         Variables:
           WEBHOOK_SECRET_PARAMETER: !Ref WebhookSecretParameterName
           DEPLOYMENT_REVIEW_QUEUE_URL: !Ref DeploymentReviewQueue
+          RUST_LOG: info
       Events:
         Health:
           Type: HttpApi
@@ -96,6 +97,7 @@ Resources:
           POLICY_JSON: !Ref PolicyJson
           APP_ID_PARAMETER: !Ref AppIdParameterName
           APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
+          RUST_LOG: info
       Events:
         DeploymentReviews:
           Type: SQS
