@@ -29,15 +29,6 @@ Resources:
   Api:
     Type: AWS::Serverless::HttpApi
 
-  DeploymentReviewDeadLetterQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub ${AWS::StackName}-reviews-dlq.fifo
-      FifoQueue: true
-      ContentBasedDeduplication: false
-      MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
-
   DeploymentReviewQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -48,9 +39,6 @@ Resources:
       VisibilityTimeout: 720
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt DeploymentReviewDeadLetterQueue.Arn
-        maxReceiveCount: 5
 
   WebhookFunction:
     Type: AWS::Serverless::Function
@@ -139,6 +127,3 @@ Outputs:
   DeploymentReviewQueueUrl:
     Description: FIFO queue used for authenticated deployment-protection requests
     Value: !Ref DeploymentReviewQueue
-  DeploymentReviewDeadLetterQueueUrl:
-    Description: FIFO queue containing deployment reviews that exhausted retries
-    Value: !Ref DeploymentReviewDeadLetterQueue
