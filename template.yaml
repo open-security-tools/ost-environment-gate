@@ -4,6 +4,20 @@ Description: >
   ost-environment-gate - validates GitHub deployment protection webhooks,
   queues them, and serializes environment reviews.
 
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: ost-environment-gate
+    Description: Evaluate GitHub Actions deployment protection rules with a trusted policy.
+    Author: open-security-tools
+    LicenseUrl: LICENSE
+    ReadmeUrl: README.md
+    Labels:
+      - github-actions
+      - deployment-protection
+      - security
+    HomePageUrl: https://github.com/open-security-tools/ost-environment-gate
+    SourceCodeUrl: https://github.com/open-security-tools/ost-environment-gate
+
 Globals:
   Function:
     Runtime: provided.al2023
