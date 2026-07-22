@@ -70,14 +70,11 @@ The minimal manifest for the GitHub App is:
     "actions": "read",
     "deployments": "write"
   },
-  "default_events": [
-    "deployment_protection_rule"
-  ]
+  "default_events": ["deployment_protection_rule"]
 }
 ```
 
 The GitHub App requires the minimum permissions to perform this action.
-
 
 ## Webhook
 
@@ -140,3 +137,12 @@ An example policy is as follows:
   "release_workflow_path": ".github/workflows/release.yml"
 }
 ```
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
