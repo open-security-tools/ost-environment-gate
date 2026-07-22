@@ -34,12 +34,55 @@ jobs:
     name: "sam validate"
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: aws-actions/setup-sam@d78e1a4a9656d3b223e59b80676a797f20093133 # v2
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        with:
+          use-installer: true
+          version: 1.163.0
+          token: ${{ github.token }}
       - run: sam validate --lint
+
+  sam-build:
+    name: sam build
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SAM_CLI_TELEMETRY: 0
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          use-cache: false
+          version: 0.15.1
+
+      - name: Install Cargo Lambda
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          fallback: none
+          tool: cargo-lambda@1.9.1
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+        with:
+          use-installer: true
+          version: 1.163.0
+          token: ${{ github.token }}
+
+      - name: Build Lambda artifacts
+        run: sam build --beta-features --no-use-container
 
   fmt:
     name: "rustfmt"
