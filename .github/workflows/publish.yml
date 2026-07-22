@@ -69,13 +69,8 @@ jobs:
       - name: Build release artifacts
         run: sam build --beta-features --no-use-container
 
-      - name: Stage application documentation
-        run: |
-          cp README.md .aws-sam/build/README.md
-          cp "${LICENSE_FILE}" ".aws-sam/build/${LICENSE_FILE}"
-
       - name: Archive built SAM application
-        run: tar -cf sam-build.tar -C .aws-sam/build .
+        run: tar -cf sam-build.tar .aws-sam/build README.md "${LICENSE_FILE}"
 
       - name: Upload built SAM application
         id: artifact
@@ -110,9 +105,7 @@ jobs:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
 
       - name: Restore built SAM application
-        run: |
-          mkdir -p .aws-sam/build
-          tar -xf sam-build.tar -C .aws-sam/build
+        run: tar -xf sam-build.tar
 
       - name: Install AWS SAM CLI
         uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
